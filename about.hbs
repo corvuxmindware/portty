@@ -1,0 +1,20 @@
+THIRD-PARTY SOFTWARE NOTICES
+
+Portty ("portty" and "portty-host") is licensed under Apache-2.0
+(see LICENSE and NOTICE). The binaries statically link the following
+open-source components. Each is provided under the license reproduced below,
+and remains the property of its respective authors.
+
+Generated with `cargo about`. Do not edit by hand.
+
+{{#each licenses}}
+================================================================================
+{{name}}{{#if id}} ({{id}}){{/if}}
+
+Used by:
+{{#each used_by}}  * {{crate.name}} {{crate.version}}
+{{/each}}
+--------------------------------------------------------------------------------
+{{text}}
+
+{{/each}}

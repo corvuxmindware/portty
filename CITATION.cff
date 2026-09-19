@@ -1,0 +1,7 @@
+cff-version: 1.2.0
+message: "If you use Portty in research or publications, please cite Corvux Mindware."
+title: "Portty"
+authors:
+  - name: "Corvux Mindware"
+repository-code: "https://github.com/corvuxmindware/portty"
+license: "Apache-2.0"

@@ -1,0 +1,59 @@
+[package]
+name = "portty-host"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Portty host daemon - PTY session manager + dumb byte pipe + local-proof server."
+
+[dependencies]
+portty-protocol = { path = "../protocol" }
+portty-transport = { path = "../transport" }
+tokio = { workspace = true }
+portable-pty = "0.9"
+axum = { version = "0.8", features = ["ws"] }
+iroh = { version = "1", default-features = false, features = ["tls-ring"] }
+serde = { workspace = true }
+serde_json = "1"
+postcard = { workspace = true }
+futures-util = "0.3"
+async-process = "2.5"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+thiserror = { workspace = true }
+directories = "6"
+qrcode = "0.14"
+rand = { workspace = true }
+hex = { workspace = true }
+subtle = { workspace = true }
+sha2 = { workspace = true }
+blake3 = { workspace = true }
+zeroize = { workspace = true }
+# `rustls-no-provider`, not `rustls`: reqwest 0.13 renamed the old `rustls-tls`
+# feature, and plain `rustls` now drags in aws-lc-rs - a second native crypto
+# stack (and NASM on Windows) alongside the ring that iroh already uses. Portty
+# stays single-stack on ring and installs the process provider itself (see
+# `install_rustls_crypto_provider` in push.rs), which is what the phone app does.
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls-no-provider"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "logging", "tls12"] }
+# ACP ceiling (host = ACP client over stdio). `async-process` is explicit so
+# Portty can apply its SIGTERM grace period around the SDK transport.
+agent-client-protocol = "2"
+
+[target.'cfg(windows)'.dependencies]
+# Keep-awake uses SetThreadExecutionState (Win32::System::Power); the PID-file
+# liveness probe uses OpenProcess (Threading) + CloseHandle (Foundation).
+windows-sys = { version = "0.61", features = [
+    "Win32_System_Power",
+    "Win32_System_Threading",
+    "Win32_Foundation",
+    "Win32_Storage_FileSystem",
+] }
+
+[target.'cfg(unix)'.dependencies]
+# `--detach`: double-fork + setsid to background the daemon after the QR is
+# shown, then dup2 /dev/null over stdout to stop logging to the freed terminal.
+libc = "0.2"
+
+[dev-dependencies]
+tempfile = "3"

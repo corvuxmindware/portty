@@ -1,0 +1,43 @@
+[Unit]
+Description=Portty host - serve terminal sessions to a paired phone
+Documentation=https://github.com/corvuxmindware/portty
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Adjust the path if you installed portty-host elsewhere (`which portty-host`).
+ExecStart=%h/.cargo/bin/portty-host serve
+# Restart on crash, but don't hammer if it's failing to start.
+Restart=on-failure
+RestartSec=3
+# The folder new shells open in - AND the root an agent may read files inside.
+#
+# Set this to ONE PROJECT, not to %h. It used to default to %h (your whole home
+# directory), which meant the agent file sandbox bounded nothing: `~/.ssh`,
+# `~/Documents`, every other repo you own were all inside it. The phone now
+# refuses to auto-approve reads when the root is that wide, so a home-directory
+# workspace means a tap for every single file the agent reads.
+Environment=PORTTY_WORKSPACE=%h/CHANGE_ME_TO_A_PROJECT
+# PAIRING UNDER A SERVICE - always `portty pair`.
+#
+# The daemon starts with pairing CLOSED and prints NO pairing material, so there
+# is nothing usable in the journal by design. journald persists whatever a daemon
+# prints, and it used to print a fresh complete key to this machine on every
+# restart plus a five-minute window to use it - so anyone who could read the
+# journal, or ship it elsewhere, could watch for a restart and enrol.
+#
+# To add a phone, once the service is up:
+#   portty pair
+# which mints FRESH pairing material over the local IPC endpoint, prints it to
+# YOUR terminal only, and stays open as the console where you confirm the
+# 6-digit code the phone shows.
+#
+# Daemon logs (safe to read; no credentials):
+#   journalctl --user -u portty-host -f
+#
+# Reconnect-by-token phones need no pairing material, so the service is "set and forget"
+# once you've paired once.
+
+[Install]
+WantedBy=default.target

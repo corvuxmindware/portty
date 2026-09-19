@@ -1,0 +1,122 @@
+[package]
+name = "portty-app"
+version = "0.1.0"
+edition = "2021"
+authors = ["Corvux Mindware"]
+license = "Apache-2.0"
+description = "Portty phone app - Tauri 2 + SolidJS core."
+
+[lib]
+name = "portty_app_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-dialog = "2"
+# Opens agent-supplied links in the system browser (desktop + mobile) instead of
+# navigating the SPA's own webview away (#53). Called only from the Rust
+# `open_external_url` command, so no JS plugin dependency / capability is needed.
+tauri-plugin-opener = "2"
+# Terminal copy/paste: the KeyBar `Paste` key and select-mode "Copy screen"
+# read/write the system clipboard. navigator.clipboard can't prompt for
+# permission inside the Android/iOS webview, so the plugin is the reliable
+# path on every platform (desktop included).
+tauri-plugin-clipboard-manager = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tokio = { version = "1", features = ["full"] }
+iroh = { version = "1", default-features = false, features = ["tls-ring"] }
+# Rustls crypto provider: Tauri/Wry builds a reqwest client while serving the
+# initial webview response, before any app code runs. If no provider is
+# installed by then, iroh's relay client (reqwest -> rustls) panics on Android
+# with "No rustls crypto provider is configured". Pin + install `ring` at
+# startup (see `install_rustls_crypto_provider` in lib.rs). Mirrors Corvux.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "logging", "tls12"] }
+postcard = { version = "1", features = ["alloc"] }
+portty-transport = { path = "../../crates/transport" }
+portty-protocol = { path = "../../crates/protocol" }
+zeroize = "1"
+blake3 = "1"
+# Wake-blob sealing (push doorbell). Already in the tree via portty-transport;
+# declared directly so the app can seal with its own phone-local key.
+# Kept in lockstep with the root workspace: the host seals and the phone opens
+# the same wake blob, so these two must not drift apart.
+chacha20poly1305 = "0.11"
+rand = "0.10"
+
+[dev-dependencies]
+tempfile = "3"
+
+# Android-only: initialize the global `ndk_context` (JavaVM + Application
+# context) from `MainActivity.onCreate` via a small JNI shim
+# (`src/android_context.rs`). Tauri V2's Android flow never runs tao's
+# `create()` - which would normally set it - so iroh's network monitor panics
+# ("android context was not initialized") on the first endpoint build. Both
+# crates are already in the tree transitively via iroh; declaring them directly
+# just lets us call the init API. Lifted from Corvux.
+[target.'cfg(target_os = "android")'.dependencies]
+jni = "0.21"
+ndk-context = "0.1"
+keyring-core = "1.0"
+android-native-keyring-store = "1.0"
+
+[target.'cfg(target_os = "ios")'.dependencies]
+keyring-core = "1.0"
+apple-native-keyring-store = { version = "1.0", features = ["protected"] }
+
+# Mobile-only (Android + iOS): biometric app-lock (D2 security hardening). The
+# plugin is registered behind `#[cfg(mobile)]` in lib.rs and gated by a
+# mobile-only capability (capabilities/mobile.json). Target-gated so desktop
+# `cargo check`/`pnpm tauri dev` never pulls it (the crate has no desktop
+# backend) - the frontend degrades gracefully when the plugin isn't registered.
+[target.'cfg(any(target_os = "android", target_os = "ios"))'.dependencies]
+tauri-plugin-biometric = "2"
+# Local OS notifications for pending agent approvals. Distinct from the push
+# doorbell in crates/push-relay: that one wakes a SUSPENDED app through APNs and
+# needs an Apple key plus a deployed relay, while this fires only when the app is
+# still alive and already has the request over the iroh pipe - no server, no
+# credentials. Same target gate and `#[cfg(mobile)]` treatment as biometric
+# above; Portty ships no desktop app, so desktop never references it.
+tauri-plugin-notification = "2"
+
+# The Tauri app is its own Cargo workspace (the root workspace excludes `app/`).
+[workspace]
+
+# Vendored copy of tauri-plugin-notification 2.3.3 with TWO Swift changes and
+# nothing else (`diff -rq` against the crates.io source shows exactly two files).
+#
+# (2) NotificationManager.init claimed `UNUserNotificationCenter.delegate`.
+# There is only one, and push_glue.mm already installs Portty's own - so
+# whichever initialised last silently evicted the other, and if the plugin won,
+# a tapped PUSH notification stopped calling porttyStoreWake and the doorbell's
+# tap -> wake-blob -> reconnect flow broke. Portty only POSTS through this
+# plugin and consumes none of its events, and posting needs no delegate, so the
+# claim is removed and push_glue keeps it.
+#
+# Upstream's `NotificationHandler.toActiveNotification` does
+# `notificationsMap[request.identifier]!`. That map is in-memory and only holds
+# what THIS process posted, so tapping a banner after iOS reaped the app
+# force-unwraps nil and crashes on launch. `didReceive` - the tap handler -
+# calls straight into it, and for Portty that is the main path: background the
+# app, an approval arrives, iOS reaps us, and the tap is how you reach the
+# blocked agent. A crash there kills the app on its way to the card and leaves
+# the agent still waiting.
+#
+# Patched as `[patch.crates-io]` rather than a path dependency so the version
+# requirement above stays honest and the redirect is obvious. Found via Corvux,
+# which carries the same fix; still broken upstream as of 2026-06-14. Drop this
+# whole directory when upstream makes the lookup safe.
+[patch.crates-io]
+tauri-plugin-notification = { path = "vendor/tauri-plugin-notification" }
+
+# Optimize DEPENDENCIES even in dev builds. The crypto stack (chacha20poly1305,
+# hkdf, ed25519-dalek) and postcard run 10-50x slower at opt-level 0, which made
+# debug builds on a real phone feel laggy on live terminal streams. Our own
+# crate stays unoptimized for fast incremental builds and honest debugging.
+[profile.dev.package."*"]
+opt-level = 3

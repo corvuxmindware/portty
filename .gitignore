@@ -1,0 +1,104 @@
+# ── Rust build artifacts ──────────────────────────────────
+/target
+app/src-tauri/target
+# Local release staging directories.
+/dist
+/pkg
+**/*.rs.bk
+Cargo.lock.bak
+
+# ── Node / frontend ───────────────────────────────────────
+app/node_modules
+app/dist
+app/.vite
+.pnpm-store
+
+# ── Local secrets / release signing material ──────────────
+.env
+.env.*
+*.env
+!.env.example
+!.env.*.example
+*.p8
+*.p12
+*.mobileprovision
+*.provisionprofile
+*.jks
+*.keystore
+key.properties
+keystore.properties
+# Firebase/APNs push configuration. google-services.json carries the project's
+# API key and client ids; the plist is its iOS twin. Neither is a signing secret,
+# but both identify the operator's Firebase project and are per-deployment
+# config, not source (see packaging/PUSH-SETUP.md).
+google-services.json
+GoogleService-Info.plist
+
+# ── Tauri Android/iOS generated build output ──────────────
+# Keep the generated project scaffolding, ignore only build output.
+app/src-tauri/gen/android/.gradle
+app/src-tauri/gen/android/app/build
+app/src-tauri/gen/android/build
+app/src-tauri/gen/android/local.properties
+app/src-tauri/gen/apple/build
+# `tauri::generate_context!` writes these JSON schemas on every build/check -
+# regenerable, so don't track them.
+app/src-tauri/gen/schemas/
+
+# ── Runtime / local data ──────────────────────────────────
+# Device identity (Ed25519 secret) fallback dir - must never be committed.
+portty-data/
+identity.bin
+portty-peers.dat
+portty-last-host.dat
+portty-pair-state-v1.dat
+portty-revocations-v1.dat
+# Credential staging files now carry a random suffix (credential.tmp-<hex>).
+*.credential.tmp
+*.credential.tmp-*
+# Phone-local push wake key, and in-progress download staging files.
+wake_key.bin
+native_token.json
+wake_blob.txt
+push_relay_secret_v2.bin
+push_registrations.json
+.portty-download-*.part
+# Raw ACP transcripts, when PORTTY_ACP_EVENT_LOG=1 is set for debugging.
+acp-events/
+acp-sessions.json
+portty-host.pid
+portty-active.dat
+*.log
+
+# ── Local coding-agent state ─────────────────────────────
+CLAUDE.local.md
+.claude/settings.local.json
+.claude/agent-memory-local/
+.claude/worktrees/
+.claude/checkpoints/
+.opencode/node_modules/
+.opencode/package.json
+.opencode/package-lock.json
+.opencode/bun.lock
+
+# ── OS / editor cruft ─────────────────────────────────────
+.DS_Store
+Thumbs.db
+
+# Keep private developer-agent workspaces out of public commits.
+/.agents/
+/.claude/
+/.codex/
+/.continue/
+/.cursor/
+/.mcp/
+/.opencode/
+/.mcp.json
+/AGENTS.md
+/CLAUDE.md
+/CODEX.md
+/opencode.json
+/.github/
+/scripts/
+/.gitleaks.toml
+/packaging/CLI_RELEASE_RUNBOOK.md

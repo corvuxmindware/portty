@@ -1,0 +1,3433 @@
+@import "tailwindcss";
+@import "@xterm/xterm/css/xterm.css";
+
+/* Bundled terminal font (JetBrains Mono Nerd Font, Mono variant).
+   Android's WebView has no "SF Mono"/"JetBrains Mono", and its default
+   `monospace` lacks box-drawing, powerline, and Nerd-Font glyphs - so terminal
+   symbols rendered as tofu/boxes there while iOS (SF Mono) looked fine. Shipping
+   the font makes both platforms render identically. */
+@font-face {
+  font-family: "JetBrainsMono Nerd Font Mono";
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+  src: url("./assets/fonts/JetBrainsMonoNerdFontMono-Regular.ttf") format("truetype");
+}
+@font-face {
+  font-family: "JetBrainsMono Nerd Font Mono";
+  font-style: normal;
+  font-weight: 700;
+  font-display: swap;
+  src: url("./assets/fonts/JetBrainsMonoNerdFontMono-Bold.ttf") format("truetype");
+}
+
+/* ─────────────────────────────────────────────────────────────────────
+   Portty design system
+
+   The look is drawn from the logo: a lime-green energy vortex on true black,
+   with a terminal `>_`. So the UI is OLED-black with a faint vortex glow for
+   depth, elevated surfaces with hairline borders lit from above, generously
+   rounded corners, and a lime accent that only *glows* where it matters
+   (brand, active state, primary action). Native SF Pro on iOS carries the
+   typography.
+   ──────────────────────────────────────────────────────────────────── */
+:root {
+  color-scheme: dark;
+
+  /* Depth: base → raised surfaces */
+  --bg: #000000;
+  --surface-1: #0d0d0f;
+  --surface-2: #16161a;
+  --surface-3: #1f1f24;
+
+  /* Hairlines - lit from above for the "premium glass" edge */
+  --border: rgba(255, 255, 255, 0.07);
+  --border-strong: rgba(255, 255, 255, 0.13);
+  --hairline-top: rgba(255, 255, 255, 0.06);
+
+  /* Text ramp */
+  --text-1: #f4f4f5;
+  --text-2: #a1a1aa;
+  /* Tertiary text still needs to CLEAR WCAG AA (4.5:1) on the dark surfaces -
+     #6a6a72 measured 3.0–3.9:1 and the whole hint/label layer uses this. */
+  --text-3: #82828c;
+
+  /* Lime accent (the vortex). Composites from these - change the accent here,
+     not in the forty places that used to hardcode rgba(163,230,53,x).
+
+     Toned down from #a3e635. The hue is unchanged (~82deg, still Portty green);
+     what read as fluorescent was the saturation, and the halo more than the
+     fill - a 0.35 glow on a black OLED spreads a visible corona around the
+     primary button and every lime border on the screen at once. Saturation
+     drops ~28% and the glow to 0.22, which takes the shine off without moving
+     the brand. Contrast is unaffected in practice: #95c247 on --bg is 10.1:1,
+     and the near-black label on a lime fill stays above 8:1. */
+  --lime: #95c247;
+  --lime-rgb: 149 194 71;
+  --lime-bright: #b0d472;
+  --lime-bright-rgb: 176 212 114;
+  --lime-deep: #5f8a2a;
+  --lime-glow: rgb(var(--lime-rgb) / 0.22);
+
+  /* Signal colors */
+  --amber: #fbbf24;
+  /* Amber glow, mirroring --lime-glow. Waiting-on-your-approval is the only
+     state that earns an outer glow on a whole card. */
+  --amber-glow: rgb(251 191 36 / 0.28);
+  /* Risk red. Rose-leaning rather than the old tomato #f87171: it sits further
+     from the lime brand accent on the wheel, so "danger" and "Portty" never read
+     as neighbouring hues, and it stays legible on near-black without glowing.
+     Everything red composites from these four - change the hue here, not in the
+     forty places that used to hardcode rgba(248,113,113,x). */
+  --red: #fb7185;
+  --red-rgb: 251 113 133;
+  --red-deep: #881337;
+  --red-deep-rgb: 136 19 55;
+  --red-100: #ffe4e6;
+  --red-300: #fda4af;
+  --red-ink: #3f0716;
+
+  /* Corners - generous, consistent */
+  --radius-lg: 1rem; /* cards */
+  --radius-md: 0.75rem; /* buttons, inputs */
+  --radius-sm: 0.55rem; /* keys, small controls */
+
+  --ease: cubic-bezier(0.4, 0, 0.2, 1);
+  --mono: "JetBrainsMono Nerd Font Mono", ui-monospace, "SF Mono", "JetBrains Mono", "Fira Code", Menlo, monospace;
+
+  font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI",
+    system-ui, sans-serif;
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+html,
+body {
+  margin: 0;
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
+}
+
+/* The app shell is pinned to the visual viewport. Mobile WebViews can both
+   shrink AND pan that viewport when the keyboard opens; sizing #root without
+   also applying the viewport offset leaves a black strip below the key bar and
+   turns the document into a swipe-scroll surface. App.tsx supplies these four
+   metrics from window.visualViewport. The vh/dvh values are the fallback for
+   WebViews without that API. */
+#root {
+  position: fixed;
+  top: var(--portty-viewport-top, 0px);
+  left: var(--portty-viewport-left, 0px);
+  width: var(--portty-viewport-width, 100vw);
+  height: var(--portty-viewport-height, 100vh);
+  height: var(--portty-viewport-height, 100dvh);
+  margin: 0;
+  overflow: hidden;
+}
+
+body {
+  position: fixed;
+  inset: 0;
+  background: var(--bg);
+  color: var(--text-1);
+  -webkit-tap-highlight-color: transparent;
+  /* No pull-to-refresh / scroll chaining into the app shell. */
+  overscroll-behavior: none;
+  /* Chrome isn't selectable; the terminal re-enables selection below. */
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+/* Ambient vortex glow - echoes the logo, gives the black real depth. Fixed so
+   it stays put while lists scroll; sits behind all app content (z-index:0). */
+body::before {
+  content: "";
+  position: fixed;
+  inset: 0;
+  z-index: 0;
+  pointer-events: none;
+  background:
+    radial-gradient(120% 55% at 50% -8%, rgb(var(--lime-rgb) / 0.1), transparent 62%),
+    radial-gradient(90% 50% at 108% 4%, rgba(101, 163, 13, 0.07), transparent 55%);
+}
+
+/* UI icons are inline SVG paths owned by Portty, never platform-font glyphs.
+   `em` sizing lets each existing control remain the sizing authority. */
+.portty-icon {
+  display: block;
+  flex: 0 0 auto;
+  width: 1.15em;
+  height: 1.15em;
+}
+
+/* Only the VISIBLE terminal rows are selectable. Deliberately narrow: xterm
+   also overlays a transparent screen-reader mirror of the buffer
+   (.xterm-accessibility, screenReaderMode) - if that stays selectable, a
+   long-press anchors the selection into invisible text on top of the rows and
+   the user "selects" nothing they can see. Selection targeting ignores
+   pointer-events, so it must be excluded via user-select. */
+.xterm,
+.xterm * {
+  user-select: none;
+  -webkit-user-select: none;
+}
+.xterm .xterm-rows,
+.xterm .xterm-rows * {
+  user-select: text;
+  -webkit-user-select: text;
+}
+
+/* Mobile keyboard fix: Android WebView only opens the soft keyboard when the
+   user taps *directly* on a real editable element - a programmatic .focus()
+   is ignored. xterm parks its helper textarea off-screen (or 1px, behind
+   everything), so taps land on the wrapper div instead and the IME never
+   shows.
+
+   So we stretch xterm's OWN textarea to cover the whole terminal, transparent
+   and on top. Now any tap on the terminal is a direct tap on the textarea →
+   Android raises the keyboard, and xterm's battle-tested input path handles
+   typing, backspace, and IME composition. Caret is hidden because xterm draws
+   its own block cursor. `!important` beats xterm's inline styles (it moves the
+   textarea to the cursor for IME positioning; we pin it full-size instead). */
+.xterm .xterm-helper-textarea {
+  position: absolute !important;
+  left: 0 !important;
+  top: 0 !important;
+  width: 100% !important;
+  height: 100% !important;
+  opacity: 0 !important;
+  z-index: 10 !important;
+  caret-color: transparent !important;
+  resize: none !important;
+  border: none !important;
+  padding: 0 !important;
+  /* 16px avoids the focus-zoom some webviews apply to smaller inputs. */
+  font-size: 16px !important;
+}
+
+/* Full-screen apps (Claude Code, vim, htop) that turn on MOUSE tracking need
+   taps to reach xterm as clicks. In that mode the keyboard overlay must not
+   swallow touches, so it becomes click-through; the ⌨ button summons the
+   keyboard instead. (Normal shells keep tap-to-type - overlay stays active.) */
+.portty-mouse-mode .xterm-helper-textarea {
+  pointer-events: none !important;
+}
+
+/* Text-select mode (KeyBar `Select` / long-press arm): the keyboard overlay
+   goes click-through so a long-press lands on the ROW TEXT - the OS word
+   selection only starts when the touched element itself is selectable text
+   (making the whole .xterm pointer-events:none kills the gesture entirely).
+   The synthesized mouse events that follow the touch would then let xterm
+   refocus its textarea and rip the fresh selection away - App.tsx swallows
+   those at document capture phase while select mode is on. */
+.portty-select-mode .xterm-helper-textarea {
+  pointer-events: none !important;
+}
+
+/* Bar shown while select mode is on: the how-to hint plus the "Copy screen"
+   fallback for webviews where touch selection misbehaves. Docked between the
+   terminal and the KeyBar - deliberately NOT overlaying the terminal, where it
+   would cover (and steal the long-press from) the very rows being copied. */
+.portty-select-bar {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.4rem 0.75rem;
+  background: linear-gradient(180deg, rgba(16, 16, 18, 0.92), rgba(8, 8, 9, 0.96));
+  border-top: 1px solid var(--border);
+}
+.portty-select-hint {
+  flex: 1 1 auto;
+  font-size: 0.72rem;
+  color: var(--text-2);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.portty-chip-btn {
+  flex: 0 0 auto;
+  padding: 0.35rem 0.7rem;
+  border-radius: 999px;
+  font-size: 0.78rem;
+  font-weight: 600;
+  color: var(--text-1);
+  background: linear-gradient(180deg, var(--surface-3), var(--surface-2));
+  border: 1px solid var(--border);
+  -webkit-tap-highlight-color: transparent;
+  touch-action: manipulation;
+}
+.portty-chip-btn:active {
+  transform: scale(0.94);
+}
+.portty-chip-btn-done {
+  background: linear-gradient(180deg, var(--lime-bright), var(--lime-deep));
+  color: #0a0f00;
+  border-color: transparent;
+}
+
+/* Safe-area insets (notches, home indicator). Requires `viewport-fit=cover`
+   in index.html for env() to resolve on iOS/Android. Lifted from Corvux.
+   position/z-index lifts app content above the ambient glow. */
+.portty-app {
+  position: relative;
+  z-index: 1;
+  padding-top: env(safe-area-inset-top, 0px);
+  padding-bottom: env(safe-area-inset-bottom, 0px);
+  padding-left: env(safe-area-inset-left, 0px);
+  padding-right: env(safe-area-inset-right, 0px);
+}
+
+/* Terminal + agent screens: their bottom docks (KeyBar / agent composer)
+   absorb the home-indicator inset themselves. Without this exemption, the
+   app's bottom safe-area padding stacks with the dock's own inset padding -
+   a ~34px dead black strip between the dock and the keyboard/home indicator.
+   List/pair screens keep the inset above. */
+.portty-app.portty-app--term {
+  padding-bottom: 0;
+}
+
+/* ── App bar (shared by every screen) ──────────────────────────────── */
+.portty-header {
+  display: flex;
+  align-items: center;
+  gap: 0.625rem;
+  padding: 0.7rem 1rem;
+  background: linear-gradient(180deg, rgba(22, 22, 26, 0.85), rgba(10, 10, 12, 0.7));
+  backdrop-filter: blur(14px) saturate(1.4);
+  -webkit-backdrop-filter: blur(14px) saturate(1.4);
+  border-bottom: 1px solid var(--border);
+}
+/* The control cluster holds its size; the title beside it is the flexible one. */
+.portty-header-actions {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 0.375rem;
+  margin-left: auto;
+}
+
+/* Terminal overflow sheet: the actions that left the toolbar so the session
+   title could stay readable. Same panel language as the transfer/policy sheets,
+   but rows are labelled - a glyph you had to learn is a poor trade for a tap. */
+.portty-term-menu {
+  z-index: 5;
+  display: grid;
+  gap: 0.35rem;
+  padding: 0.5rem;
+  border-bottom: 1px solid var(--border);
+  background: var(--surface-2);
+}
+.portty-term-menu button {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  min-height: 2.75rem;
+  padding: 0 0.7rem;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--surface-1);
+  color: var(--text-1);
+  font-size: 0.85rem;
+  text-align: left;
+}
+.portty-term-menu button:disabled {
+  opacity: 0.4;
+}
+.portty-term-menu button .portty-icon {
+  flex: none;
+  width: 1.05rem;
+  height: 1.05rem;
+  color: var(--text-2);
+}
+.portty-term-menu-danger {
+  color: var(--red-300);
+}
+.portty-term-menu-danger .portty-icon {
+  color: var(--red-300);
+}
+/* Armed kill: the row itself becomes the confirmation, so it has to stop
+   looking like the other two rows. */
+.portty-term-menu-danger.portty-kill-armed {
+  border-color: rgb(var(--red-rgb) / 0.85);
+  background: rgb(var(--red-deep-rgb) / 0.45);
+  color: var(--red-100);
+  font-weight: 600;
+}
+.portty-term-menu-danger.portty-kill-armed .portty-icon {
+  color: var(--red-100);
+}
+/* A live state inside the collapsed menu (paused output, an armed kill) must
+   still be visible from the toolbar, or hiding the button hides the state. */
+.portty-icon-live-dot {
+  position: absolute;
+  top: 0.3rem;
+  right: 0.3rem;
+  width: 0.4rem;
+  height: 0.4rem;
+  border-radius: 999px;
+  background: var(--amber);
+}
+
+.portty-logo {
+  width: 2rem;
+  height: 2rem;
+  border-radius: 0.6rem;
+  object-fit: cover;
+  /* Vortex glow ring around the mark. */
+  box-shadow: 0 0 0 1px var(--border-strong), 0 0 18px var(--lime-glow);
+}
+.portty-brand {
+  font-weight: 700;
+  font-size: 1.02rem;
+  letter-spacing: -0.01em;
+  /* Signature lime→white wash. */
+  background: linear-gradient(92deg, var(--lime-bright), #ffffff 70%);
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+}
+/* The title takes the leftover space and ellipsizes there. Without an explicit
+   min-width:0 a flex item refuses to shrink past its content, so the browser
+   resolved the conflict with the button cluster by crushing the title to 12px -
+   "project-portty" rendered as "p." on a 16 Pro and vanished entirely on an SE.
+   min-width also gives it a floor: if a header ever runs out of room again the
+   controls scroll, they do not eat the name of the session you are typing into. */
+.portty-header-title {
+  flex: 1 1 auto;
+  min-width: 4.5rem;
+  font-weight: 700;
+  font-size: 0.98rem;
+  letter-spacing: -0.01em;
+  color: var(--lime-bright);
+}
+
+/* Status indicator: a single colored dot conveys connection state at a glance -
+   green = paired & connected, red = not connected. No text, no amber. */
+.portty-status {
+  margin-left: auto;
+  display: inline-flex;
+  align-items: center;
+  padding: 0.35rem;
+  border-radius: 999px;
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+}
+.portty-status-dot {
+  flex: 0 0 auto;
+  width: 0.55rem;
+  height: 0.55rem;
+  border-radius: 999px;
+  background: var(--red);
+}
+.portty-status-dot[data-state="ok"] {
+  background: var(--lime);
+  box-shadow: 0 0 8px var(--lime-glow);
+}
+.portty-status-dot[data-state="err"] {
+  background: var(--red);
+}
+
+/* ── Session list (home screen) ────────────────────────────────────── */
+.portty-host-switcher {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  padding: 0.45rem 0.85rem;
+  border-bottom: 1px solid var(--border);
+  background: rgba(13, 13, 15, 0.78);
+}
+.portty-host-switcher-label {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  color: var(--text-3);
+  font-size: 0.75rem;
+  font-weight: 650;
+  letter-spacing: 0.02em;
+}
+.portty-host-switcher-label > .portty-icon {
+  color: var(--lime-bright);
+  font-size: 1rem;
+}
+.portty-host-select-wrap {
+  position: relative;
+  flex: 1 1 auto;
+  min-width: 0;
+}
+/* Custom dropdown trigger - replaces the native <select> so Android does not
+   pop a full-screen OS picker. */
+.portty-host-select {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  width: 100%;
+  min-height: 2.35rem;
+  padding: 0 0.7rem;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-md);
+  background: var(--surface-2);
+  color: var(--text-1);
+  font-size: 0.9rem;
+  font-weight: 600;
+  text-align: left;
+  touch-action: manipulation;
+}
+.portty-host-select:focus-visible {
+  outline: none;
+  border-color: var(--lime-deep);
+  box-shadow: 0 0 0 3px rgb(var(--lime-rgb) / 0.13);
+}
+.portty-host-select:disabled {
+  opacity: 0.65;
+}
+.portty-host-select-value {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.portty-host-select-chevron {
+  flex: 0 0 auto;
+  color: var(--lime-bright);
+  width: 1rem;
+  height: 1rem;
+  transition: transform 0.18s var(--ease);
+}
+.portty-host-select[aria-expanded="true"] .portty-host-select-chevron {
+  transform: rotate(180deg);
+}
+
+/* Inline dropdown menu (the styled replacement for the OS picker window). */
+.portty-host-menu {
+  position: absolute;
+  top: calc(100% + 0.35rem);
+  left: 0;
+  right: 0;
+  z-index: 60;
+  margin: 0;
+  padding: 0.3rem;
+  list-style: none;
+  max-height: 15rem;
+  overflow-y: auto;
+  background: var(--surface-3);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-md);
+  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.55);
+}
+/* A per-machine setting hanging off its machine row. Indented and quieter so the
+   list still reads as "which machine", with the setting subordinate to it rather
+   than looking like another machine you could switch to. */
+.portty-host-menu-sub {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+  width: 100%;
+  min-height: 2rem;
+  /* Indent clears the machine glyph above, so it reads as belonging to it. */
+  padding: 0 0.55rem 0 1.85rem;
+  border: none;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--text-2);
+  font-size: 0.78rem;
+  text-align: left;
+  touch-action: manipulation;
+}
+.portty-host-menu-sub:active {
+  background: rgb(var(--lime-rgb) / 0.08);
+}
+.portty-host-menu-sub-value {
+  overflow: hidden;
+  /* Front-truncated like every other path in the app: the tail is the folder. */
+  direction: rtl;
+  text-align: right;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--lime-bright);
+  font-family: var(--mono);
+  font-size: 0.7rem;
+}
+.portty-host-menu-sub-label {
+  flex: none;
+}
+.portty-host-menu-item {
+  display: flex;
+  align-items: center;
+  gap: 0.55rem;
+  width: 100%;
+  min-height: 2.25rem;
+  padding: 0 0.55rem;
+  border: none;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--text-1);
+  font-size: 0.88rem;
+  font-weight: 600;
+  text-align: left;
+  touch-action: manipulation;
+}
+.portty-host-menu-item:active {
+  background: var(--surface-2);
+}
+.portty-host-menu-item--active {
+  background: rgb(var(--lime-rgb) / 0.1);
+}
+/* Machine glyph on each saved host - "this row is a computer". Muted by
+   default so the list reads as a set of equals; the active row lifts it to the
+   accent, alongside the tick, so the current machine is marked twice without
+   the others looking faulty. */
+.portty-host-menu-glyph {
+  flex: 0 0 auto;
+  width: 1rem;
+  height: 1rem;
+  color: var(--text-3);
+}
+.portty-host-menu-item--active .portty-host-menu-glyph {
+  color: var(--lime);
+}
+/* Same glyph on the closed control, so it and the open list read as one thing. */
+.portty-host-select-glyph {
+  flex: 0 0 auto;
+  width: 1rem;
+  height: 1rem;
+  color: var(--text-3);
+}
+.portty-host-menu-name {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.portty-host-menu-check {
+  flex: 0 0 auto;
+  color: var(--lime-bright);
+  width: 1rem;
+  height: 1rem;
+}
+/* "+ Add host" action row - divided off from the host list and lime-accented so
+   it reads as an action, not another host to select. */
+.portty-host-menu-add {
+  margin-top: 0.3rem;
+  padding-top: 0.55rem;
+  border-top: 1px solid var(--border);
+  color: var(--lime-bright);
+}
+.portty-host-menu-plus {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 0.9rem;
+  font-size: 1.15rem;
+  font-weight: 700;
+  line-height: 1;
+  color: var(--lime-bright);
+}
+.portty-host-menu-add .portty-host-menu-name {
+  color: var(--lime-bright);
+}
+
+.portty-session-card {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  min-height: 3.5rem;
+  padding: 0.8rem 0.85rem;
+  border-radius: var(--radius-lg);
+  background: linear-gradient(180deg, var(--surface-2), var(--surface-1));
+  border: 1px solid var(--border);
+  box-shadow: inset 0 1px 0 var(--hairline-top), 0 1px 3px rgba(0, 0, 0, 0.45);
+  cursor: pointer;
+  transition:
+    transform 0.15s var(--ease),
+    border-color 0.15s var(--ease),
+    box-shadow 0.15s var(--ease),
+    background 0.15s var(--ease);
+  -webkit-tap-highlight-color: transparent;
+  touch-action: manipulation;
+}
+/* Waiting on YOUR approval, carried by the whole card rather than an 8px dot.
+   A 0.5rem dot on a 372x70 card is easy to scroll straight past, and this is the
+   one session state where missing it means an agent sits blocked. Amber outranks
+   lime, so this deliberately reads louder than the has-new-output dot.
+   The glow is static; the dot inside keeps the pulse, so exactly one thing
+   moves. */
+.portty-session-card--waiting {
+  border-color: var(--amber);
+  background: linear-gradient(180deg, rgb(251 191 36 / 0.09), var(--surface-1));
+  /* One glow, no ring. The ring sat directly on top of an amber border and did
+     no work, and 18px bled into the next card once several agents waited at
+     once - adjacent glows merged into a wash where nothing stood out. 9px reads
+     on a single card without reaching its neighbour. */
+  box-shadow:
+    inset 0 1px 0 var(--hairline-top),
+    0 1px 3px rgba(0, 0, 0, 0.45),
+    0 0 9px var(--amber-glow);
+}
+.portty-session-card--waiting:active {
+  border-color: var(--amber);
+  background: linear-gradient(180deg, rgb(251 191 36 / 0.14), var(--surface-2));
+}
+/* Slightly larger inside a waiting card - it is the card's subject, not a
+   footnote on it. */
+/* The count of approvals this session is waiting on. Static: the card's amber
+   glow is already the attention-getter, and a pulsing number is harder to read
+   than a still one. Not interactive - the card behind it takes the tap. */
+.portty-session-pending {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 1.35rem;
+  min-height: 1.35rem;
+  padding: 0 0.32rem;
+  border-radius: 999px;
+  border: 1px solid rgb(251 191 36 / 0.55);
+  background: rgb(113 63 18 / 0.35);
+  color: var(--amber);
+  font-family: var(--mono);
+  font-size: 0.72rem;
+  font-weight: 700;
+  line-height: 1;
+}
+
+.portty-session-card:active {
+  transform: scale(0.985);
+  border-color: var(--border-strong);
+  background: linear-gradient(180deg, var(--surface-3), var(--surface-2));
+}
+/* Leading terminal chip - the `>_` from the logo, per card. */
+.portty-session-icon {
+  flex: 0 0 auto;
+  display: grid;
+  place-items: center;
+  width: 2.3rem;
+  height: 2.3rem;
+  border-radius: 0.65rem;
+  background: radial-gradient(
+    120% 120% at 30% 20%,
+    rgb(var(--lime-rgb) / 0.2),
+    rgb(var(--lime-rgb) / 0.03)
+  );
+  border: 1px solid rgb(var(--lime-rgb) / 0.22);
+  color: var(--lime-bright);
+  font-family: var(--mono);
+  font-size: 0.85rem;
+  font-weight: 700;
+}
+.portty-session-body {
+  flex: 1 1 auto;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+}
+.portty-session-name {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 0.95rem;
+  font-weight: 500;
+  color: var(--text-1);
+}
+.portty-activity-dot {
+  flex: 0 0 auto;
+  width: 0.5rem;
+  height: 0.5rem;
+  border-radius: 999px;
+  background: var(--lime);
+  box-shadow: 0 0 8px var(--lime-glow);
+  animation: portty-pulse 2s var(--ease) infinite;
+}
+.portty-activity-dot--waiting {
+  background: var(--amber);
+  box-shadow: 0 0 8px rgba(251, 191, 36, 0.55);
+}
+.portty-session-actions {
+  flex: 0 0 auto;
+  display: flex;
+  gap: 0.35rem;
+}
+.portty-session-actions button {
+  position: relative;
+  display: grid;
+  place-items: center;
+  width: 2.75rem;
+  height: 2.75rem;
+  border-radius: 0.55rem;
+  background: var(--surface-3);
+  color: var(--text-2);
+  border: 1px solid var(--border);
+  font-size: 0.9rem;
+  transition:
+    background 0.12s var(--ease),
+    color 0.12s var(--ease),
+    transform 0.12s var(--ease);
+  -webkit-tap-highlight-color: transparent;
+  touch-action: manipulation;
+}
+.portty-session-actions button:active {
+  background: #2a2a30;
+  color: var(--text-1);
+  transform: scale(0.92);
+}
+.portty-rename-input {
+  flex: 1 1 auto;
+  min-width: 0;
+  height: 2.3rem;
+  padding: 0 0.65rem;
+  border-radius: 0.55rem;
+  background: #000;
+  border: 1px solid var(--lime-deep);
+  box-shadow: 0 0 0 3px rgb(var(--lime-rgb) / 0.14);
+  color: var(--text-1);
+  font-size: 0.95rem;
+}
+.portty-rename-input:focus {
+  outline: none;
+}
+
+.portty-transfer-status {
+  padding: 0.35rem 0.75rem;
+  border-bottom: 1px solid var(--border);
+  background: rgb(var(--lime-rgb) / 0.08);
+  color: var(--text-2);
+  font: 0.72rem var(--mono);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.portty-reconnect-toast {
+  position: fixed;
+  z-index: 50;
+  top: calc(env(safe-area-inset-top) + 3.5rem);
+  left: 50%;
+  transform: translateX(-50%);
+  border: 1px solid rgb(var(--lime-rgb) / 0.35);
+  border-radius: 999px;
+  padding: 0.45rem 0.75rem;
+  background: rgba(10, 10, 10, 0.94);
+  color: var(--lime-bright);
+  font-size: 0.72rem;
+  box-shadow: 0 8px 30px rgba(0, 0, 0, 0.45);
+}
+/* Status mirror on non-home screens: neutral, and below the reconnect toast
+   slot so the two never overlap. */
+.portty-status-toast {
+  top: calc(env(safe-area-inset-top) + 5.6rem);
+  max-width: min(85vw, 26rem);
+  border-color: var(--border-strong);
+  color: var(--text-1);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* ── Agent header controls ─────────────────────────────────────────────
+   These sat at three different heights - 44px buttons beside a 22px badge whose
+   height was whatever its padding happened to produce - spaced with the header's
+   own gap, so the cluster read as unrelated items drifting toward the edge.
+
+   One shared height for everything interactive, one tighter gap, one group. The
+   height is a touch under the 44pt floor because these are secondary controls
+   inside a padded header, which keeps their effective target well above it while
+   letting the title breathe on a narrow phone. */
+.portty-agent-header {
+  /* On the HEADER, not the cluster: the back button lives outside the cluster
+     and must share the height, or the row is 44px on the left and 38px on the
+     right - the same misalignment one step over. */
+  --header-ctl-h: 2.4rem;
+}
+.portty-agent-header .portty-icon-btn {
+  min-width: var(--header-ctl-h);
+  height: var(--header-ctl-h);
+  padding: 0 0.55rem;
+}
+.portty-agent-header .portty-icon-btn .portty-icon {
+  width: 1.1rem;
+  height: 1.1rem;
+}
+.portty-agent-header-actions {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  /* Own the right edge regardless of how short the title is. */
+  margin-left: auto;
+  flex: 0 0 auto;
+}
+/* A text button, not an icon one - give it real horizontal padding instead of
+   inheriting a square's. */
+.portty-agent-stop {
+  padding: 0 0.75rem;
+  font-size: 0.82rem;
+  font-weight: 600;
+}
+/* The agent header's title floor is smaller than the terminal's: it shares the
+   row with the policy badge and Stop, which are words rather than glyphs. */
+.portty-agent-header .portty-header-title {
+  min-width: 3rem;
+}
+
+.portty-policy-badge {
+  display: inline-flex;
+  align-items: center;
+  flex: 0 0 auto;
+  /* Matches the buttons beside it. Status, not an action - so it keeps the pill
+     shape to stay distinguishable, but never a different height. */
+  height: var(--header-ctl-h, 2.4rem);
+  padding: 0 0.65rem;
+  border: 1px solid rgb(var(--lime-rgb) / 0.32);
+  border-radius: 999px;
+  background: rgb(var(--lime-rgb) / 0.08);
+  color: var(--lime-bright);
+  font-family: var(--mono);
+  font-size: 0.66rem;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  line-height: 1;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+.portty-latency-chip {
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 0.15rem 0.45rem;
+  color: var(--text-2);
+  font: 0.62rem var(--mono);
+  white-space: nowrap;
+}
+.portty-yolo-confirm {
+  border: 1px solid rgb(var(--red-rgb) / 0.65);
+  border-radius: 0.5rem;
+  padding: 0.5rem 0.65rem;
+  background: rgb(var(--red-deep-rgb) / 0.35);
+  color: var(--red-100);
+  font-size: 0.72rem;
+  text-align: left;
+}
+.portty-policy-badge[data-tier="yolo"],
+.portty-policy-panel[data-tier="yolo"] {
+  border-color: rgb(var(--red-rgb) / 0.65);
+  background: rgb(var(--red-deep-rgb) / 0.25);
+  color: var(--red-100);
+}
+.portty-policy-panel {
+  z-index: 5;
+  display: grid;
+  gap: 0.6rem;
+  padding: 0.75rem;
+  border-bottom: 1px solid var(--border);
+  background: var(--surface-2);
+  color: var(--text-2);
+  font-size: 0.75rem;
+}
+/* Labeled form field: small caption above the input. */
+.portty-field {
+  display: grid;
+  gap: 0.3rem;
+  color: var(--text-3);
+  font-size: 0.75rem;
+  font-weight: 600;
+}
+
+/* File-transfer sheet: same panel language as the policy panel. */
+.portty-transfer-sheet {
+  z-index: 5;
+  display: grid;
+  gap: 0.6rem;
+  padding: 0.75rem;
+  border-bottom: 1px solid var(--border);
+  background: var(--surface-2);
+  color: var(--text-2);
+  font-size: 0.75rem;
+}
+.portty-transfer-sheet > label {
+  display: grid;
+  gap: 0.3rem;
+}
+.portty-transfer-sheet input[type="text"] {
+  min-height: 2.75rem;
+  padding: 0 0.65rem;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-md);
+  background: #111214;
+  color: var(--text-1);
+  font-family: var(--mono);
+  font-size: 16px; /* avoids iOS focus-zoom on smaller inputs */
+}
+.portty-transfer-sheet input[type="text"]:focus {
+  outline: none;
+  border-color: var(--lime-deep);
+}
+/* Sheet heading row: title on the left, a way out on the right. */
+.portty-sheet-bar {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+.portty-sheet-bar .portty-sheet-title {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+.portty-sheet-close {
+  flex: none;
+  display: grid;
+  place-items: center;
+  width: 2.75rem;
+  height: 2.75rem;
+  margin: -0.5rem -0.35rem -0.5rem 0;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--text-3);
+}
+.portty-sheet-close:active {
+  background: var(--surface-3);
+  color: var(--text-1);
+}
+.portty-sheet-close .portty-icon {
+  width: 1.05rem;
+  height: 1.05rem;
+}
+/* Sheet heading - shared by the transfer and policy panels. */
+.portty-sheet-title {
+  display: flex;
+  align-items: center;
+  gap: 0.45rem;
+  margin: 0;
+  color: var(--text-1);
+  font-size: 0.85rem;
+  font-weight: 650;
+}
+.portty-sheet-title .portty-icon {
+  width: 1rem;
+  height: 1rem;
+  color: var(--text-2);
+}
+/* This is the control that leaves the home-folder sandbox, and it was the
+   smallest target in the app - an 18px box you had to hit exactly. The whole
+   row is now the target, and the box itself clears the 24px minimum for a
+   checkbox with a full-row label. */
+.portty-transfer-outside {
+  display: flex !important;
+  align-items: center;
+  gap: 0.6rem;
+  min-height: 2.75rem;
+  padding: 0 0.15rem;
+  cursor: pointer;
+}
+.portty-transfer-outside input {
+  accent-color: var(--lime);
+  flex: none;
+  width: 1.5rem;
+  height: 1.5rem;
+}
+.portty-transfer-actions {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 0.5rem;
+}
+.portty-transfer-actions button {
+  min-height: 2.75rem;
+}
+.portty-policy-panel label {
+  display: grid;
+  gap: 0.3rem;
+}
+.portty-policy-panel select,
+.portty-policy-panel textarea {
+  width: 100%;
+  border: 1px solid var(--border-strong);
+  border-radius: 0.45rem;
+  padding: 0.45rem;
+  background: #080808;
+  color: var(--text-1);
+  font: 0.75rem var(--mono);
+}
+.portty-policy-log-row {
+  display: grid;
+  grid-template-columns: 4.5rem 5rem 4.5rem 1fr;
+  gap: 0.3rem 0.5rem;
+  padding: 0.3rem 0;
+  border-top: 1px solid var(--border);
+  align-items: baseline;
+}
+.portty-log-source {
+  font-family: var(--mono);
+  font-size: 0.66rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--text-3);
+}
+.portty-policy-log-row[data-source="manual-reject"] .portty-log-source {
+  color: var(--red-100);
+}
+.portty-policy-log-row[data-source="manual-allow"] .portty-log-source,
+.portty-policy-log-row[data-source="learned-exact"] .portty-log-source {
+  color: var(--lime-bright);
+}
+.portty-log-input {
+  grid-column: 1 / -1;
+  font-family: var(--mono);
+  font-size: 0.66rem;
+  color: var(--text-2);
+  background: var(--surface-2);
+  border-radius: 0.3rem;
+  padding: 0.2rem 0.4rem;
+  margin-top: 0.15rem;
+  overflow-x: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.portty-policy-log-row strong {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.portty-exact-rules {
+  display: grid;
+  gap: 0.35rem;
+}
+.portty-exact-rule-row {
+  display: grid;
+  grid-template-columns: 4.5rem minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 0.4rem;
+  padding-top: 0.35rem;
+  border-top: 1px solid var(--border);
+}
+.portty-exact-rule-row span {
+  color: var(--lime-bright);
+  font-family: var(--mono);
+}
+.portty-exact-rule-row code {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.portty-exact-rule-row button {
+  border: 1px solid var(--border-strong);
+  border-radius: 0.45rem;
+  padding: 0.3rem 0.45rem;
+  background: transparent;
+  color: var(--text-2);
+}
+
+/* Empty state */
+.portty-empty {
+  display: flex;
+  height: 100%;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 0.9rem;
+  text-align: center;
+  color: var(--text-3);
+}
+.portty-empty-glyph {
+  display: grid;
+  place-items: center;
+  width: 4.5rem;
+  height: 4.5rem;
+  border-radius: 1.25rem;
+  background: radial-gradient(
+    120% 120% at 30% 20%,
+    rgb(var(--lime-rgb) / 0.16),
+    rgb(var(--lime-rgb) / 0.02)
+  );
+  border: 1px solid rgb(var(--lime-rgb) / 0.2);
+  color: var(--lime-bright);
+  font-family: var(--mono);
+  font-size: 1.5rem;
+  font-weight: 700;
+  box-shadow: 0 0 30px rgb(var(--lime-rgb) / 0.12);
+}
+.portty-empty-title {
+  font-size: 0.95rem;
+  font-weight: 600;
+  color: var(--text-2);
+}
+.portty-empty-sub {
+  font-size: 0.8rem;
+  max-width: 15rem;
+}
+
+/* Docked action bar (New session) */
+.portty-footer {
+  padding: 0.85rem 1rem;
+  border-top: 1px solid var(--border);
+  background: linear-gradient(180deg, transparent, rgba(0, 0, 0, 0.5));
+}
+.portty-new-session-btn {
+  width: 100%;
+  padding: 0.9rem;
+  border-radius: var(--radius-md);
+  background: linear-gradient(180deg, var(--lime-bright), var(--lime-deep));
+  color: #0a0f00;
+  font-weight: 700;
+  font-size: 0.95rem;
+  letter-spacing: 0.01em;
+  border: none;
+  box-shadow:
+    0 6px 22px rgb(var(--lime-rgb) / 0.28),
+    inset 0 1px 0 rgba(255, 255, 255, 0.35);
+  transition:
+    transform 0.15s var(--ease),
+    box-shadow 0.15s var(--ease),
+    filter 0.15s var(--ease);
+  -webkit-tap-highlight-color: transparent;
+  touch-action: manipulation;
+}
+.portty-new-session-btn:active {
+  transform: scale(0.98) translateY(1px);
+  box-shadow: 0 3px 12px rgb(var(--lime-rgb) / 0.22);
+  filter: brightness(0.96);
+}
+.portty-new-session-btn:disabled {
+  opacity: 0.6;
+  filter: grayscale(0.3);
+  box-shadow: none;
+}
+/* Secondary action under "New session" when connected - add another host. */
+.portty-add-host-btn {
+  width: 100%;
+  margin-top: 0.5rem;
+  padding: 0.7rem;
+  border-radius: var(--radius-md);
+  background: transparent;
+  color: var(--text-2);
+  font-weight: 600;
+  font-size: 0.9rem;
+  border: 1px solid var(--border);
+  -webkit-tap-highlight-color: transparent;
+  touch-action: manipulation;
+}
+.portty-add-host-btn:active {
+  transform: scale(0.98) translateY(1px);
+  filter: brightness(1.1);
+}
+
+/* ── Small icon/pill buttons (terminal header, back) ───────────────── */
+.portty-icon-btn {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  /* 2.75rem ≈ Apple's 44pt touch-target floor. */
+  min-width: 2.75rem;
+  height: 2.75rem;
+  padding: 0 0.5rem;
+  border-radius: var(--radius-sm);
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  color: var(--text-2);
+  font-size: 0.85rem;
+  transition:
+    background 0.12s var(--ease),
+    color 0.12s var(--ease),
+    transform 0.12s var(--ease);
+  -webkit-tap-highlight-color: transparent;
+  touch-action: manipulation;
+}
+.portty-icon-btn:active {
+  background: var(--surface-3);
+  color: var(--text-1);
+  transform: scale(0.94);
+}
+.portty-icon-btn:disabled {
+  opacity: 0.3;
+}
+.portty-icon-confirm-mark {
+  position: absolute;
+  top: 0.18rem;
+  right: 0.22rem;
+  display: grid;
+  place-items: center;
+  min-width: 0.85rem;
+  height: 0.85rem;
+  border-radius: 999px;
+  background: var(--red);
+  color: #190404;
+  font: 700 0.62rem/1 var(--mono);
+}
+/* Glanceable pending-approval count in the home header. Amber, like the
+   per-session "waiting for approval" dot, since it's the one interrupt-worthy
+   state. */
+/* Floating touch-scrollback controls, pinned bottom-right over the terminal.
+   z-index sits ABOVE xterm's full-cover helper textarea (z-index: 10) so the
+   taps actually land instead of being swallowed by the hidden input. */
+/* Attach/resume loading state, centered over the (still-black) terminal. */
+.portty-term-loading {
+  position: absolute;
+  inset: 0;
+  z-index: 25;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.5rem;
+  color: var(--text-3);
+  font-family: var(--mono);
+  font-size: 0.8rem;
+  pointer-events: none;
+}
+/* Opening the portal.
+   Not a rotating ring. A mote REVOLVES around a still centre, and the whole
+   figure BREATHES - the vortex in the app mark, at 18px, doing the one thing
+   the screen is actually waiting for. The ring is now only the orbit track:
+   static, barely there, and nothing about it spins.
+   The revolve (1.3s) and the breath (2.4s) are deliberately not multiples of
+   each other, so they drift apart and re-meet instead of locking into a short
+   visible loop - the difference between something alive and something looping. */
+.portty-term-spinner {
+  position: relative;
+  width: 1.15rem;
+  height: 1.15rem;
+  border-radius: 50%;
+  border: 1px solid color-mix(in srgb, var(--lime) 16%, transparent);
+  animation: portty-portal-breathe 2.4s ease-in-out infinite;
+}
+/* The travelling mote. A hard-stop radial gradient lets ONE pseudo-element be
+   both the orbit and the dot riding on it, which keeps ::after free for the
+   core and the whole spinner down to a single empty <span>. */
+.portty-term-spinner::before {
+  content: "";
+  position: absolute;
+  /* Inset by the mote's radius and place its centre the same distance in, so
+     the dot sits ON the orbit track and renders whole. Centred at `50% 0` it
+     was bisected by the box edge and only ever drew as a half-disc. */
+  inset: -3px;
+  border-radius: 50%;
+  background: radial-gradient(circle 3px at 50% 3px, var(--lime-bright) 0 100%, transparent 100%);
+  animation: portty-portal-revolve 1.3s linear infinite;
+}
+/* The centre being opened - a soft core on its own slower breath. */
+.portty-term-spinner::after {
+  content: "";
+  position: absolute;
+  inset: 28%;
+  border-radius: 50%;
+  background: var(--lime);
+  animation: portty-portal-core 2.4s ease-in-out infinite;
+}
+@keyframes portty-portal-revolve {
+  to {
+    transform: rotate(360deg);
+  }
+}
+@keyframes portty-portal-breathe {
+  0%,
+  100% {
+    transform: scale(0.92);
+    opacity: 0.75;
+  }
+  50% {
+    transform: scale(1.06);
+    opacity: 1;
+  }
+}
+@keyframes portty-portal-core {
+  0%,
+  100% {
+    transform: scale(0.55);
+    opacity: 0.22;
+  }
+  50% {
+    transform: scale(1);
+    opacity: 0.6;
+  }
+}
+/* Reduced motion: hold the figure at a legible resting frame rather than
+   hiding it - it is the only thing on screen saying the app is not stuck. */
+@media (prefers-reduced-motion: reduce) {
+  /* The waiting card is legible from colour and glow alone, so drop the only
+     moving part rather than pulsing in someone's peripheral vision. */
+  .portty-activity-dot,
+  .portty-activity-dot--waiting {
+    animation: none;
+  }
+  .portty-term-spinner,
+  .portty-term-spinner::before,
+  .portty-term-spinner::after {
+    animation: none;
+  }
+  .portty-term-spinner::after {
+    transform: scale(0.8);
+    opacity: 0.5;
+  }
+}
+.portty-scroll-ctl {
+  position: absolute;
+  right: 0.6rem;
+  bottom: 0.6rem;
+  z-index: 30;
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+}
+.portty-scroll-ctl .portty-icon-btn {
+  min-width: 2.4rem;
+  height: 2.4rem;
+  opacity: 0.55;
+  background: color-mix(in srgb, var(--surface-2) 82%, transparent);
+  backdrop-filter: blur(6px);
+  -webkit-backdrop-filter: blur(6px);
+}
+.portty-scroll-ctl .portty-icon-btn:active {
+  opacity: 1;
+}
+/* Fit/match render-mode toggle: a small text pill ("Fit" / "1:1"). */
+.portty-mode-btn {
+  font-size: 0.72rem;
+  font-weight: 650;
+  letter-spacing: 0.02em;
+}
+
+/* The document viewport is fixed, but the terminal owns a custom two-pointer
+   font zoom plus a one-finger drag that scrolls xterm's scrollback.
+
+   `touch-action: none` is the DEFAULT here on purpose: the moment an axis is
+   opened, the webview compositor claims drags along it and `preventDefault()`
+   on pointermove stops working (WebKit additionally stops delivering the
+   moves). So an axis is opened only when the match-mode grid genuinely
+   overflows and there is something for a native pan to do - App.tsx's
+   measurePan() adds these classes, and the drag handler reads the same
+   signals. A zoomed-out grid keeps `none`, and the drag scrolls history. */
+.portty-term-zoom {
+  touch-action: none;
+}
+.portty-term-zoom.portty-term-pan {
+  overflow: auto;
+  -webkit-overflow-scrolling: touch;
+}
+.portty-term-zoom.portty-term-pan-x {
+  touch-action: pan-x;
+}
+.portty-term-zoom.portty-term-pan-xy {
+  touch-action: pan-x pan-y;
+}
+
+/* ⌨ is a toggle. Light it up while the keyboard is up so "tap again to put it
+   away" is discoverable - on iOS a WKWebView textarea has no "Done" key, and
+   this button is the only way down. */
+.portty-icon-btn.portty-kb-on {
+  color: var(--lime-bright);
+  border-color: color-mix(in srgb, var(--lime-bright) 55%, transparent);
+  background: color-mix(in srgb, var(--lime-bright) 12%, transparent);
+}
+
+/* Armed close-confirm (✕ → ✕?): `window.confirm` is a no-op in WKWebView, so
+   closing a session is a two-tap confirm - the armed state turns the button
+   red until it auto-disarms. Applies to the header ✕ and session-row ✕. */
+.portty-icon-btn.portty-kill-armed,
+.portty-session-actions button.portty-kill-armed {
+  color: var(--red);
+  border-color: color-mix(in srgb, var(--red) 55%, transparent);
+  background: color-mix(in srgb, var(--red) 12%, transparent);
+}
+
+/* ── Pair form ─────────────────────────────────────────────────────── */
+.portty-card {
+  background: linear-gradient(180deg, var(--surface-2), var(--surface-1));
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  box-shadow: inset 0 1px 0 var(--hairline-top);
+  padding: 1.1rem;
+}
+.portty-input {
+  width: 100%;
+  padding: 0.7rem 0.85rem;
+  border-radius: var(--radius-md);
+  background: var(--surface-1);
+  border: 1px solid var(--border);
+  color: var(--text-1);
+  font-size: 0.9rem;
+  transition:
+    border-color 0.15s var(--ease),
+    box-shadow 0.15s var(--ease);
+  -webkit-appearance: none;
+  appearance: none;
+}
+.portty-input::placeholder {
+  color: var(--text-3);
+}
+.portty-input:focus {
+  outline: none;
+  border-color: var(--lime-deep);
+  box-shadow: 0 0 0 3px rgb(var(--lime-rgb) / 0.15);
+}
+.portty-input--mono {
+  font-family: var(--mono);
+  font-size: 0.82rem;
+}
+.portty-btn-primary {
+  width: 100%;
+  padding: 0.75rem;
+  border-radius: var(--radius-md);
+  background: linear-gradient(180deg, var(--lime-bright), var(--lime-deep));
+  color: #0a0f00;
+  font-weight: 700;
+  font-size: 0.92rem;
+  border: none;
+  box-shadow:
+    0 6px 22px rgb(var(--lime-rgb) / 0.26),
+    inset 0 1px 0 rgba(255, 255, 255, 0.35);
+  transition:
+    transform 0.15s var(--ease),
+    filter 0.15s var(--ease);
+  -webkit-tap-highlight-color: transparent;
+  touch-action: manipulation;
+}
+.portty-btn-primary:active {
+  transform: scale(0.98);
+  filter: brightness(0.96);
+}
+.portty-btn-ghost {
+  flex: 1 1 auto;
+  padding: 0.6rem;
+  border-radius: var(--radius-md);
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  color: var(--text-2);
+  font-size: 0.8rem;
+  font-weight: 500;
+  transition:
+    background 0.12s var(--ease),
+    color 0.12s var(--ease);
+  -webkit-tap-highlight-color: transparent;
+  touch-action: manipulation;
+}
+.portty-btn-ghost:active {
+  background: var(--surface-3);
+  color: var(--text-1);
+}
+.portty-saved-host-row {
+  display: flex;
+  align-items: stretch;
+  gap: 0.5rem;
+}
+.portty-saved-host-connect {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  min-width: 0;
+  text-align: left;
+}
+.portty-saved-host-connect > span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+/* Every trailing control on a saved-host row: rename, remove, and the
+   save/cancel pair the rename editor swaps in. Uniform square-ish targets so
+   the row's right edge stays put as the row changes mode. */
+.portty-host-row-btn {
+  display: grid;
+  place-items: center;
+  flex: 0 0 auto;
+  min-width: 2.6rem;
+  padding: 0 0.65rem;
+  border-radius: var(--radius-md);
+  background: transparent;
+  border: 1px solid var(--border);
+  color: var(--text-3);
+  font-size: 0.78rem;
+  font-weight: 650;
+  -webkit-tap-highlight-color: transparent;
+  touch-action: manipulation;
+}
+.portty-host-row-btn:active {
+  background: var(--surface-3);
+}
+.portty-host-row-btn--armed {
+  color: var(--red-100);
+  border-color: rgba(239, 68, 68, 0.72);
+  background: rgb(var(--red-deep-rgb) / 0.32);
+}
+.portty-forget-all-btn {
+  min-height: 2.6rem;
+  margin-top: 0.15rem;
+  padding: 0 0.65rem;
+  border-radius: var(--radius-md);
+  background: transparent;
+  border: 1px dashed var(--border);
+  color: var(--text-3);
+  font-size: 0.78rem;
+  font-weight: 650;
+  -webkit-tap-highlight-color: transparent;
+  touch-action: manipulation;
+}
+.portty-forget-all-btn:active {
+  background: var(--surface-3);
+}
+.portty-forget-all-btn--armed {
+  color: var(--red-100);
+  border-color: rgba(239, 68, 68, 0.72);
+  border-style: solid;
+  background: rgb(var(--red-deep-rgb) / 0.32);
+}
+.portty-link {
+  font-size: 0.8rem;
+  color: var(--text-2);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+.portty-btn-with-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.4rem;
+}
+.portty-btn-primary:disabled,
+.portty-btn-ghost:disabled,
+.portty-link:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+  box-shadow: none;
+}
+.portty-hint {
+  font-size: 0.78rem;
+  line-height: 1.4;
+  color: var(--text-3);
+}
+.portty-hint code {
+  font-family: var(--mono);
+  font-size: 0.75rem;
+  color: var(--lime-bright);
+  background: rgb(var(--lime-rgb) / 0.08);
+  padding: 0.05rem 0.3rem;
+  border-radius: 0.3rem;
+}
+
+/* ── Pairing comparison code ───────────────────────────────────────────
+   Shown mid-handshake while the host waits for a human to confirm. The digits
+   are the one thing on screen the user must actually read and compare, so they
+   get the largest type in the pair form and generous letter spacing - a
+   misread 6 vs 8 defeats the whole check. Not a warning surface: this is the
+   normal path, so it stays in the neutral card palette and only the mismatch
+   line carries alarm colour. */
+.portty-pair-code {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  padding: 0.85rem;
+  border: 1px solid rgb(var(--lime-rgb) / 0.35);
+  border-radius: 0.6rem;
+  background: rgb(var(--lime-rgb) / 0.06);
+  text-align: center;
+}
+.portty-pair-code__label {
+  font-size: 0.78rem;
+  line-height: 1.4;
+  color: var(--text-2);
+}
+.portty-pair-code__digits {
+  font-family: var(--mono);
+  /* Scales with the user's text-size setting but never overflows a narrow
+     phone: 2rem at the default root size, capped against the viewport. */
+  font-size: clamp(1.5rem, 9vw, 2rem);
+  font-weight: 700;
+  letter-spacing: 0.18em;
+  color: var(--lime-bright);
+  /* Long-press to copy is meaningless here and gets in the way of reading. */
+  user-select: none;
+}
+.portty-pair-code__warn {
+  font-size: 0.72rem;
+  line-height: 1.4;
+  color: var(--text-3);
+}
+
+/* ── Command composer ──────────────────────────────────────────────────
+   Docked between the terminal and the KeyBar and styled to match both, so the
+   composer + keys read as one input surface rather than two stacked bars. No
+   border-bottom: the KeyBar's border-top already draws that seam. */
+.portty-cmdbar {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.4rem 0.6rem;
+  background: linear-gradient(180deg, rgba(16, 16, 18, 0.92), rgba(8, 8, 9, 0.96));
+  border-top: 1px solid var(--border);
+}
+/* Stands in for the composer inside a full-screen app. One thin line, quiet
+   enough to ignore once learned, present enough that its absence is explained
+   rather than mysterious. */
+.portty-cmdbar-hint {
+  padding: 0.3rem 0.7rem;
+  background: linear-gradient(180deg, rgba(16, 16, 18, 0.92), rgba(8, 8, 9, 0.96));
+  border-top: 1px solid var(--border);
+  color: var(--text-3);
+  font-size: 0.68rem;
+  text-align: center;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.portty-cmdbar-input {
+  flex: 1 1 auto;
+  min-width: 0; /* let it shrink inside the flex row instead of pushing Send off */
+  height: 2.4rem;
+  padding: 0 0.7rem;
+  border-radius: var(--radius-sm);
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  box-shadow: inset 0 1px 0 var(--hairline-top);
+  color: var(--text-1);
+  /* Mono so what you compose lines up with what the terminal will echo back. */
+  font-family: var(--mono);
+  /* 16px avoids the focus-zoom some webviews apply to smaller inputs - a zoom
+     here would resize the terminal underneath mid-compose. Same reason as the
+     xterm helper textarea and the transfer sheet. */
+  font-size: 16px;
+}
+.portty-cmdbar-input::placeholder {
+  color: var(--text-2);
+}
+.portty-cmdbar-input:focus {
+  outline: none;
+  border-color: var(--lime-deep);
+  box-shadow: 0 0 0 1px var(--lime-deep);
+}
+.portty-cmdbar-send {
+  display: grid;
+  place-items: center;
+  flex: 0 0 auto;
+  width: 2.4rem;
+  height: 2.4rem;
+  border-radius: var(--radius-sm);
+  background: linear-gradient(180deg, var(--lime-bright), var(--lime-deep));
+  border: 1px solid transparent;
+  color: #0a0f00;
+  -webkit-tap-highlight-color: transparent;
+  touch-action: manipulation;
+  transition:
+    transform 0.1s var(--ease),
+    opacity 0.1s var(--ease);
+}
+.portty-cmdbar-send:active:not(:disabled) {
+  transform: scale(0.92);
+}
+/* Empty draft: dimmed rather than hidden, so the row never changes height and
+   the Send target stays where the thumb last found it. */
+.portty-cmdbar-send:disabled {
+  background: linear-gradient(180deg, var(--surface-3), var(--surface-2));
+  border-color: var(--border);
+  color: var(--text-2);
+  opacity: 0.6;
+}
+
+/* ── Accessory key bar (two tiers) ──────────────────────────────────────
+   The wrapper owns the surface so the panel and the primary row read as one
+   slab, and the safe-area inset is absorbed once at the bottom. */
+.portty-keybar-wrap {
+  background: linear-gradient(180deg, rgba(16, 16, 18, 0.92), rgba(8, 8, 9, 0.96));
+  backdrop-filter: blur(14px);
+  -webkit-backdrop-filter: blur(14px);
+  border-top: 1px solid var(--border);
+  /* The bottom absorbs the home-indicator safe-area inset so the gradient fills
+     that strip (no black gap above the keyboard) and the keys clear the
+     indicator when the keyboard is down. */
+  padding-bottom: env(safe-area-inset-bottom, 0px);
+}
+
+/* Primary row: NEVER scrolls. Keys share the width equally, so the row fits on
+   any phone by construction - the old `overflow-x: auto` row hid its whole tail
+   (every arrow included) behind an invisible scroll. */
+.portty-keybar {
+  display: flex;
+  gap: 0.25rem;
+  padding: 0.25rem 0.25rem 0;
+}
+.portty-keybar > .portty-key {
+  flex: 1 1 0;
+  min-width: 0; /* allow the shrink; the 2.75rem HEIGHT keeps the tap target */
+  /* Side padding would fight the flex share on a narrow phone and clip labels
+     before the box actually runs out of room. */
+  padding: 0 0.15rem;
+  overflow: hidden;
+}
+
+/* Panel: labelled sections of wrapping grids - everything visible at once, no
+   hidden tail. Capped so it can never push the terminal off-screen; past the cap
+   it scrolls rather than growing. */
+.portty-keypanel {
+  max-height: 42vh;
+  overflow-y: auto;
+  padding: 0.4rem 0.25rem;
+  border-bottom: 1px solid var(--border);
+  /* Momentum scrolling, and don't hand the terminal a fling that started here. */
+  -webkit-overflow-scrolling: touch;
+  overscroll-behavior: contain;
+  /* Five groups do not fit 42vh, so the panel has always scrolled - but it cut
+     the function row dead level with the accessory bar, which looks like the
+     panel simply ends there. Symbols were unreachable in practice because
+     nothing said to keep going. Fade the cut so it reads as "more below". */
+  mask-image: linear-gradient(to bottom, #000 calc(100% - 1.5rem), transparent);
+  -webkit-mask-image: linear-gradient(to bottom, #000 calc(100% - 1.5rem), transparent);
+}
+.portty-keypanel-group + .portty-keypanel-group {
+  margin-top: 0.5rem;
+}
+.portty-keypanel-title {
+  margin: 0 0 0.25rem 0.15rem;
+  font-size: 0.62rem;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--text-2);
+}
+.portty-keypanel-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(2.75rem, 1fr));
+  gap: 0.25rem;
+}
+/* Labelled actions need room for the word; let them span two cells. */
+.portty-key-wide {
+  grid-column: span 2;
+}
+
+.portty-key {
+  display: grid;
+  place-items: center;
+  flex: 0 0 auto;
+  min-width: 2.75rem;
+  height: 2.75rem;
+  padding: 0 0.6rem;
+  border-radius: var(--radius-sm);
+  background: linear-gradient(180deg, var(--surface-3), var(--surface-2));
+  border: 1px solid var(--border);
+  box-shadow: inset 0 1px 0 var(--hairline-top);
+  color: var(--text-1);
+  font-size: 0.82rem;
+  font-family: var(--mono);
+  line-height: 2.4rem;
+  text-align: center;
+  transition:
+    transform 0.1s var(--ease),
+    background 0.1s var(--ease);
+  -webkit-tap-highlight-color: transparent;
+  touch-action: manipulation; /* kill the 300ms tap delay */
+}
+.portty-key:active {
+  transform: scale(0.92);
+  background: var(--surface-3);
+}
+.portty-key-active {
+  background: linear-gradient(180deg, var(--lime-bright), var(--lime-deep));
+  color: #0a0f00;
+  border-color: transparent;
+  box-shadow: 0 0 14px var(--lime-glow);
+}
+
+@keyframes portty-pulse {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.35;
+  }
+}
+
+/* ── Biometric app-lock screen ───────────────────────────────────────
+   Full-screen gate shown on cold start (pre-bootstrap) and again as an
+   overlay when the app returns from background. OLED-black with the lime
+   vortex glow to match the brand. */
+.portty-lock {
+  position: fixed;
+  inset: 0;
+  z-index: 9999;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 0.6rem;
+  padding: 2rem 1.5rem calc(2rem + env(safe-area-inset-bottom));
+  background: radial-gradient(
+      120% 80% at 50% 18%,
+      rgb(var(--lime-rgb) / 0.1),
+      transparent 60%
+    ),
+    var(--bg);
+  -webkit-user-select: none;
+  user-select: none;
+}
+.portty-lock--overlay {
+  /* Same surface, just sits on top of the live app when re-locking on resume. */
+  backdrop-filter: blur(8px);
+  -webkit-backdrop-filter: blur(8px);
+}
+.portty-lock-logo {
+  width: 96px;
+  height: 96px;
+  border-radius: 22px;
+  box-shadow: 0 0 36px var(--lime-glow);
+  margin-bottom: 0.4rem;
+}
+.portty-lock-title {
+  margin: 0;
+  font-size: 1.6rem;
+  font-weight: 700;
+  letter-spacing: -0.02em;
+  color: var(--text-1);
+}
+.portty-lock-sub {
+  margin: 0;
+  color: var(--text-2);
+  font-size: 0.92rem;
+}
+.portty-lock-error {
+  margin: 0;
+  color: var(--red);
+  font-size: 0.82rem;
+  text-align: center;
+  max-width: 18rem;
+}
+.portty-lock-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.45rem;
+  margin-top: 0.9rem;
+  min-width: 11rem;
+  padding: 0.85rem 1.4rem;
+  border-radius: var(--radius-md);
+  border: 1px solid var(--border-strong);
+  background: linear-gradient(180deg, var(--lime-bright), var(--lime-deep));
+  color: #0a0f00;
+  font-size: 1rem;
+  font-weight: 650;
+  box-shadow: 0 0 22px var(--lime-glow);
+  transition: transform 0.12s var(--ease), box-shadow 0.12s var(--ease);
+}
+.portty-lock-btn:active {
+  transform: scale(0.97);
+}
+.portty-lock-btn:disabled {
+  opacity: 0.6;
+}
+
+/* ── Structured coding-agent companion ──────────────────────────────
+   This deliberately reads like a native activity feed, not a terminal skin.
+   ACP text, plans, tools, and approvals each get a compact semantic surface. */
+.portty-agent-screen {
+  display: flex;
+  height: 100%;
+  min-height: 0;
+  flex-direction: column;
+  background:
+    radial-gradient(85% 42% at 50% 0%, rgb(var(--lime-rgb) / 0.075), transparent 72%),
+    var(--bg);
+}
+.portty-agent-header {
+  flex: 0 0 auto;
+}
+.portty-agent-mark,
+.portty-agent-avatar {
+  display: inline-grid;
+  flex: 0 0 auto;
+  place-items: center;
+  border: 1px solid rgb(var(--lime-rgb) / 0.3);
+  color: #101500;
+  /* The mint end of the gradient is its own hue, so it does not ride --lime and
+     had to come down by hand - left at #44d8b4 it became the single brightest
+     object on the agent screen the moment the accent was toned. Same treatment:
+     hue held, saturation pulled back to sit level with the new lime. */
+  background: linear-gradient(145deg, var(--lime-bright), #46b9a0);
+  font-weight: 800;
+  box-shadow: 0 0 15px rgb(var(--lime-rgb) / 0.16);
+}
+.portty-agent-mark {
+  /* Deliberately smaller than the controls - it is a brand mark, not a button -
+     but close enough to sit on the same optical line rather than reading as a
+     third size in the row. */
+  width: 2rem;
+  height: 2rem;
+  border-radius: 0.55rem;
+  font-size: 0.66rem;
+}
+.portty-agent-avatar {
+  width: 1.75rem;
+  height: 1.75rem;
+  border-radius: 0.55rem;
+  font-size: 0.62rem;
+}
+.portty-agent-turn i {
+  width: 0.42rem;
+  height: 0.42rem;
+  border-radius: 999px;
+  background: var(--lime);
+  box-shadow: 0 0 8px var(--lime-glow);
+}
+.portty-agent-feed {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 0.8rem;
+  padding: 1rem 0.85rem 1.5rem;
+  scroll-padding-bottom: 2rem;
+  -webkit-overflow-scrolling: touch;
+  user-select: text;
+  -webkit-user-select: text;
+}
+.portty-agent-empty {
+  margin: auto;
+  display: flex;
+  max-width: 17rem;
+  flex-direction: column;
+  align-items: center;
+  gap: 0.55rem;
+  padding: 2rem;
+  text-align: center;
+  color: var(--text-3);
+}
+.portty-agent-empty > span {
+  display: grid;
+  place-items: center;
+  width: 3.5rem;
+  height: 3.5rem;
+  border-radius: 1rem;
+  border: 1px solid rgb(var(--lime-rgb) / 0.2);
+  background: rgb(var(--lime-rgb) / 0.07);
+  color: var(--lime-bright);
+  font-size: 1.4rem;
+  box-shadow: 0 0 28px rgb(var(--lime-rgb) / 0.1);
+}
+.portty-agent-empty > span .portty-icon {
+  width: 1.5rem;
+  height: 1.5rem;
+}
+.portty-agent-empty strong {
+  color: var(--text-2);
+  font-size: 0.98rem;
+}
+.portty-agent-empty p {
+  margin: 0;
+  font-size: 0.8rem;
+  line-height: 1.5;
+}
+.portty-agent-user {
+  align-self: flex-end;
+  max-width: 88%;
+  padding: 0.72rem 0.85rem;
+  border-radius: 1rem 1rem 0.25rem 1rem;
+  background: linear-gradient(145deg, #252a1d, #191d14);
+  border: 1px solid rgb(var(--lime-rgb) / 0.19);
+  color: var(--text-1);
+  font-size: 0.86rem;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+/* ── The agent feed's single left edge ─────────────────────────────────
+   Everything the agent produces - prose, reasoning, tool cards, plans, errors -
+   starts at ONE x. It previously did not: assistant text sat at 2.4rem, thought
+   text at ~3.2rem, and cards at 0 with their titles at 3.4rem. Four edges in one
+   column is what made the feed look unfinished, and no amount of per-component
+   polish fixes it while they disagree.
+
+   Only the avatar lives left of this line, and only on the row that opens a
+   run. The user's own bubble is exempt - it is right-aligned by design. */
+.portty-agent-feed {
+  --agent-gutter: 2.4rem; /* avatar 1.75 + gap 0.65 */
+}
+.portty-agent-response {
+  display: grid;
+  grid-template-columns: 1.75rem minmax(0, 1fr);
+  gap: 0.65rem;
+  align-items: start;
+  color: #e5e7eb;
+  font-size: 0.88rem;
+  line-height: 1.62;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+/* Continuation blocks keep the text on the gutter with no badge re-stamped. */
+.portty-agent-response.is-continuation {
+  grid-template-columns: minmax(0, 1fr);
+  padding-left: var(--agent-gutter);
+}
+.portty-agent-response > .portty-agent-md {
+  padding-top: 0.18rem;
+}
+/* Cards align their OUTER edge to the same gutter, so the card border and the
+   prose above it share a line rather than stepping in and out. */
+.portty-agent-tool,
+.portty-agent-plan,
+.portty-agent-error {
+  margin-left: var(--agent-gutter);
+}
+/* Rendered markdown: agent replies are markdown-dense; raw fences and **bold**
+   read as broken output. Normal whitespace (blocks manage their own spacing). */
+.portty-agent-md {
+  white-space: normal;
+}
+.portty-agent-md p {
+  margin: 0 0 0.55rem;
+  white-space: pre-wrap;
+}
+.portty-agent-md p:last-child {
+  margin-bottom: 0;
+}
+.portty-agent-md .portty-md-heading {
+  color: var(--text-1);
+  font-weight: 700;
+}
+.portty-agent-md ul,
+.portty-agent-md ol {
+  margin: 0 0 0.55rem;
+  padding-left: 1.15rem;
+}
+.portty-agent-md li {
+  margin: 0.15rem 0;
+}
+.portty-agent-md code {
+  padding: 0.08rem 0.3rem;
+  border: 1px solid var(--border);
+  border-radius: 0.35rem;
+  background: #080909;
+  font-family: var(--mono);
+  font-size: 0.8rem;
+}
+.portty-agent-md .portty-md-code {
+  overflow-x: auto;
+  margin: 0 0 0.55rem;
+  padding: 0.65rem;
+  border: 1px solid var(--border);
+  border-radius: 0.6rem;
+  background: #080909;
+}
+.portty-agent-md .portty-md-code code {
+  padding: 0;
+  border: none;
+  background: transparent;
+  white-space: pre;
+}
+.portty-agent-md a {
+  color: var(--lime-bright);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+/* ── Reasoning ─────────────────────────────────────────────────────────
+   Was a bare <details> with the browser's default triangle and the word
+   "Reasoning". A turn emits several of these interleaved with tool calls, so the
+   feed became a stack of identical grey rows carrying no information. Now each
+   one previews its own opening line, and the tail block of a running turn says
+   so - the reasoning is subordinate to the answer, but never anonymous. */
+.portty-agent-thought {
+  margin-left: var(--agent-gutter);
+  border-left: 1px solid var(--border-strong);
+  padding: 0.1rem 0 0.1rem 0.7rem;
+  color: var(--text-3);
+  font-size: 0.77rem;
+}
+.portty-agent-thought summary {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  cursor: pointer;
+  color: var(--text-2);
+  font-weight: 600;
+  list-style: none; /* kill the default marker... */
+  -webkit-tap-highlight-color: transparent;
+}
+.portty-agent-thought summary::-webkit-details-marker {
+  display: none; /* ...including WebKit's, which ignores list-style */
+}
+.portty-agent-thought-icon {
+  flex: 0 0 auto;
+  width: 0.85rem;
+  height: 0.85rem;
+  opacity: 0.75;
+}
+.portty-agent-thought-peek {
+  flex: 1 1 auto;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-weight: 500;
+  /* Muted and italic so a collapsed preview never competes with the answer. */
+  font-style: italic;
+  color: var(--text-3);
+}
+.portty-agent-thought-chevron {
+  flex: 0 0 auto;
+  width: 0.8rem;
+  height: 0.8rem;
+  opacity: 0.5;
+  transition: transform 0.15s var(--ease);
+}
+.portty-agent-thought[open] > summary > .portty-agent-thought-chevron {
+  transform: rotate(180deg);
+}
+/* Expanded: the preview would repeat the first line of the body directly below
+   it, so swap in a plain label instead. */
+.portty-agent-thought-label {
+  display: none;
+  flex: 1 1 auto;
+  font-weight: 600;
+  color: var(--text-2);
+}
+.portty-agent-thought[open] > summary > .portty-agent-thought-peek {
+  display: none;
+}
+.portty-agent-thought[open] > summary > .portty-agent-thought-label {
+  display: block;
+}
+.portty-agent-thought p {
+  margin: 0.45rem 0 0;
+  line-height: 1.55;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+/* Live: the agent is still reasoning. The rail brightens and the label breathes
+   so a running turn is legible at a glance without a spinner shouting. */
+.portty-agent-thought.is-live {
+  border-left-color: rgb(var(--lime-rgb) / 0.45);
+}
+.portty-agent-thought.is-live > summary > .portty-agent-thought-peek {
+  color: var(--lime-bright);
+  animation: portty-thinking 1.6s var(--ease) infinite;
+}
+.portty-agent-thought.is-live > summary > .portty-agent-thought-icon {
+  color: var(--lime-bright);
+  opacity: 1;
+}
+@keyframes portty-thinking {
+  0%,
+  100% {
+    opacity: 0.55;
+  }
+  50% {
+    opacity: 1;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .portty-agent-thought.is-live > summary > .portty-agent-thought-peek {
+    animation: none;
+  }
+  .portty-agent-thought-chevron {
+    transition: none;
+  }
+}
+.portty-agent-tool,
+.portty-agent-plan,
+.portty-agent-permission {
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  background: linear-gradient(160deg, rgba(27, 28, 31, 0.96), rgba(15, 16, 18, 0.96));
+  box-shadow: inset 0 1px 0 var(--hairline-top), 0 6px 24px rgba(0, 0, 0, 0.16);
+}
+.portty-agent-tool {
+  display: grid;
+  grid-template-columns: 2rem minmax(0, 1fr) 1.3rem;
+  gap: 0.65rem;
+  align-items: start;
+  padding: 0.75rem;
+}
+.portty-agent-tool[data-status="completed"] {
+  border-color: rgb(var(--lime-rgb) / 0.18);
+}
+.portty-agent-tool[data-status="failed"] {
+  border-color: rgb(var(--red-rgb) / 0.4);
+}
+.portty-agent-tool-glyph {
+  display: grid;
+  place-items: center;
+  width: 2rem;
+  height: 2rem;
+  border-radius: 0.58rem;
+  background: #090a0b;
+  border: 1px solid var(--border);
+  color: var(--lime-bright);
+  font-family: var(--mono);
+  font-weight: 750;
+}
+.portty-agent-tool-glyph .portty-icon {
+  width: 1.05rem;
+  height: 1.05rem;
+}
+/* Delete is the one timeline kind that removes something. It reads in lime like
+   every other row, which is the reassuring colour - so the shape (a bin, not a
+   pencil) carries the difference and the tint only confirms it. Never colour
+   alone: the glyph is the signal. */
+.portty-agent-tool-glyph[data-kind="delete"] {
+  border-color: rgb(var(--red-rgb) / 0.4);
+  color: var(--red-300);
+}
+.portty-agent-tool-body {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.15rem;
+}
+.portty-agent-tool-body strong {
+  color: var(--text-1);
+  font-size: 0.82rem;
+  font-weight: 650;
+  overflow-wrap: anywhere;
+}
+.portty-agent-tool-kind {
+  color: var(--text-3);
+  font-family: var(--mono);
+  /* Smaller than the title it labels: an eyebrow the eye passes over on the way
+     to the thing that matters, not a second headline competing with it. */
+  font-size: 0.62rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.09em;
+  line-height: 1.2;
+}
+/* ── Tool output ───────────────────────────────────────────────────────
+   Collapsed by default. Rendered raw, one `read` of a 115-line file produced
+   three screens of escaped JSON and buried the entire conversation around it.
+   Output is evidence you consult on demand, not prose in the reading flow. */
+.portty-agent-tool-output {
+  margin-top: 0.5rem;
+}
+.portty-agent-tool-output > summary {
+  display: flex;
+  align-items: center;
+  gap: 0.35rem;
+  padding: 0.3rem 0.45rem;
+  border: 1px solid var(--border);
+  border-radius: 0.5rem;
+  background: #0b0c0d;
+  color: var(--text-2);
+  font-size: 0.7rem;
+  font-weight: 600;
+  cursor: pointer;
+  list-style: none;
+  -webkit-tap-highlight-color: transparent;
+}
+.portty-agent-tool-output > summary::-webkit-details-marker {
+  display: none;
+}
+.portty-agent-tool-output > summary small {
+  margin-left: auto;
+  color: var(--text-3);
+  font-family: var(--mono);
+  font-size: 0.66rem;
+  font-weight: 500;
+}
+.portty-agent-tool-output-chevron {
+  width: 0.75rem;
+  height: 0.75rem;
+  opacity: 0.6;
+  transition: transform 0.15s var(--ease);
+}
+.portty-agent-tool-output[open] > summary > .portty-agent-tool-output-chevron {
+  transform: rotate(180deg);
+}
+/* Even expanded it scrolls INSIDE its own box, so opening one result never
+   pushes the rest of the turn off screen. */
+.portty-agent-tool-output > pre {
+  max-height: 45vh;
+  overflow: auto;
+  overscroll-behavior: contain;
+}
+@media (prefers-reduced-motion: reduce) {
+  .portty-agent-tool-output-chevron {
+    transition: none;
+  }
+}
+
+.portty-agent-tool-body pre,
+.portty-agent-permission code {
+  overflow-x: auto;
+  margin: 0.55rem 0 0;
+  padding: 0.65rem;
+  border: 1px solid var(--border);
+  border-radius: 0.6rem;
+  background: #080909;
+  /* A lime-tinted mono, so it tracks the accent rather than staying at the old
+     brightness once --lime came down. */
+  color: color-mix(in srgb, var(--lime-bright) 62%, #e8e8e0);
+  font-family: var(--mono);
+  font-size: 0.72rem;
+  line-height: 1.45;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.portty-agent-tool-status {
+  display: grid;
+  place-items: center;
+  color: var(--text-3);
+  font-family: var(--mono);
+  text-align: center;
+}
+.portty-agent-tool-status .portty-icon {
+  width: 0.95rem;
+  height: 0.95rem;
+}
+.portty-agent-tool[data-status="in_progress"] .portty-agent-tool-status {
+  color: var(--lime-bright);
+  animation: portty-pulse 1.1s var(--ease) infinite;
+}
+.portty-agent-tool[data-status="completed"] .portty-agent-tool-status {
+  color: var(--lime);
+}
+.portty-agent-tool[data-status="failed"] .portty-agent-tool-status {
+  color: var(--red);
+}
+.portty-agent-plan {
+  padding: 0.85rem;
+}
+.portty-agent-card-label {
+  margin-bottom: 0.55rem;
+  color: var(--text-3);
+  font-family: var(--mono);
+  font-size: 0.72rem;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+.portty-agent-plan-row {
+  display: grid;
+  grid-template-columns: 1.1rem minmax(0, 1fr);
+  gap: 0.45rem;
+  padding: 0.38rem 0;
+  color: var(--text-2);
+  font-size: 0.78rem;
+  line-height: 1.4;
+}
+.portty-agent-plan-row span {
+  display: grid;
+  place-items: center;
+  color: var(--text-3);
+  font-family: var(--mono);
+}
+.portty-agent-plan-row span .portty-icon {
+  width: 0.85rem;
+  height: 0.85rem;
+}
+.portty-agent-plan-row p {
+  margin: 0;
+}
+.portty-agent-plan-row[data-status="in_progress"] {
+  color: var(--text-1);
+}
+.portty-agent-plan-row[data-status="in_progress"] span,
+.portty-agent-plan-row[data-status="completed"] span {
+  color: var(--lime);
+}
+.portty-agent-plan-row[data-status="completed"] p {
+  color: var(--text-3);
+  text-decoration: line-through;
+  text-decoration-color: rgb(var(--lime-rgb) / 0.28);
+}
+.portty-agent-turn {
+  align-self: center;
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  padding: 0.25rem 0.55rem;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: rgba(18, 18, 20, 0.86);
+  color: var(--text-3);
+  font-family: var(--mono);
+  font-size: 0.72rem;
+}
+.portty-agent-turn:not(.is-running) i {
+  opacity: 0.45;
+  box-shadow: none;
+}
+.portty-agent-turn.is-running i {
+  animation: portty-pulse 1.1s var(--ease) infinite;
+}
+.portty-agent-error {
+  padding: 0.7rem 0.8rem;
+  border: 1px solid rgb(var(--red-rgb) / 0.36);
+  border-radius: var(--radius-md);
+  background: rgb(var(--red-deep-rgb) / 0.17);
+  color: var(--red-100);
+  font-size: 0.76rem;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+/* The permission card is the app's ONE interrupt - it gets the app's one
+   amber moment (lime stays on the Allow button and brand chrome). The layer
+   sits OUTSIDE the feed scroller so an arriving approval can never hide
+   below the fold while the user reads back. */
+.portty-agent-permission-layer {
+  flex: 0 0 auto;
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  /* dvh, and a px floor: 45% of an SE in landscape is not enough to hold a
+     decision row, and a card whose buttons do not fit is not a decision. */
+  max-height: max(45dvh, 19rem);
+  padding: 0.6rem 0.8rem 0.2rem;
+  border-top: 1px solid var(--border);
+  background: rgba(11, 11, 13, 0.96);
+  overscroll-behavior: contain;
+}
+/* The card owns the scrolling now, not the layer. The layer only distributes
+   height between cards; if it scrolled too, a card could be pushed out whole. */
+.portty-agent-permission {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  /* Never taller than the layer that bounds it. */
+  max-height: 100%;
+}
+/* Detail scrolls. The fade is the only thing that says so - a hard cut through
+   a line of a command reads as a rendering fault, not as "there is more". */
+.portty-agent-permission-body {
+  /* Sizes to its content, and SHRINKS when the card would otherwise outgrow the
+     layer - deliberately not min-height, which cannot be shrunk and so made the
+     card taller than its layer on a short screen, pushing Dismiss back under
+     the composer (the exact failure this restructure exists to prevent).
+     Shrinking here is what keeps the pinned row pinned: the detail gives up
+     height, the decision never does. A short request stays fully visible and
+     un-faded; a long one scrolls. */
+  flex: 0 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  -webkit-overflow-scrolling: touch;
+  mask-image: linear-gradient(to bottom, #000 calc(100% - 1.25rem), transparent);
+  -webkit-mask-image: linear-gradient(to bottom, #000 calc(100% - 1.25rem), transparent);
+}
+/* Nothing to scroll: drop the fade so a short card is not dimmed for no reason.
+   :has() is unavailable on the iOS 14 target, so this rides the same explicit
+   attribute pattern the risk styling uses. */
+.portty-agent-permission-body[data-scroll="none"] {
+  mask-image: none;
+  -webkit-mask-image: none;
+}
+/* Pinned. This row is the entire point of the interrupt; it does not scroll,
+   it does not shrink, and it is never the part that falls off the bottom. */
+.portty-agent-permission-actions {
+  flex: 0 0 auto;
+}
+/* "2 of 3" - a queued approval must be countable from the card on screen. */
+.portty-agent-permission-queue {
+  flex: 0 0 auto;
+  padding: 0.12rem 0.4rem;
+  border: 1px solid var(--border-strong);
+  border-radius: 0.35rem;
+  background: var(--surface-3);
+  color: var(--text-2);
+  font-family: var(--mono);
+  font-size: 0.62rem;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  white-space: nowrap;
+}
+/* ── Permission card: quiet by default ────────────────────────────────
+   Every permission card used to arrive in an amber frame, over an amber
+   tint, under an amber glow, with an amber category chip - so "approve a
+   directory listing" and "hand over an SSH key" looked the same, and the
+   genuinely dangerous card had nothing left to escalate WITH. Colour is now
+   spent only where there is real risk: `data-risk` (set in AgentView from
+   the sensitive-path check and the destructive/unknown categories) is the
+   single thing that can introduce it. A routine card is the same neutral
+   surface as everything else in the feed. ─────────────────────────────── */
+.portty-agent-avatar--attention {
+  background: var(--surface-3);
+  color: var(--text-2);
+  border: 1px solid var(--border-strong);
+}
+.portty-agent-permission {
+  padding: 0.85rem;
+}
+.portty-agent-permission[data-risk] {
+  border-color: rgb(var(--red-rgb) / 0.5);
+  background: rgb(var(--red-deep-rgb) / 0.16);
+  box-shadow: inset 0 1px 0 var(--hairline-top), 0 0 26px rgb(var(--red-rgb) / 0.08);
+}
+.portty-agent-permission[data-risk] .portty-agent-avatar--attention {
+  border-color: transparent;
+  background: linear-gradient(160deg, var(--red), var(--red-deep));
+  color: var(--red-ink);
+}
+/* Four things share this line - badge, "Permission required", the category chip
+   and the session name. On a phone the session name is the one that can be any
+   length, so it takes the leftover space and ellipsizes there; everything else
+   holds its size instead of being squeezed by it. */
+/* Wraps rather than crushes. With a queue badge in the row there is not enough
+   width left for a session name too, and "Rele…" at 37px identifies nothing -
+   which matters here specifically, because the session name is what stops
+   someone approving the right-looking action on the wrong session. Given a
+   5rem floor it drops to its own line instead of ellipsizing into noise. */
+.portty-agent-permission-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.35rem 0.5rem;
+  min-width: 0;
+}
+.portty-agent-permission-head > strong {
+  flex: 0 0 auto;
+  font-size: 0.86rem;
+}
+.portty-agent-permission-head > .portty-agent-avatar,
+.portty-agent-permission-cat {
+  flex: 0 0 auto;
+}
+.portty-agent-permission-session {
+  flex: 1 1 5rem;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  text-align: right;
+  color: var(--text-3);
+  font-size: 0.66rem;
+}
+.portty-agent-permission-head strong {
+  color: var(--text-1);
+  font-size: 0.86rem;
+}
+.portty-agent-permission-head small {
+  margin-left: auto;
+  color: var(--text-3);
+  font-family: var(--mono);
+}
+/* The tool line is the card's headline, not a warning. A blanket amber here
+   survived the quiet-by-default pass and undid most of it: every routine
+   EXECUTE card still opened with an amber line, which is exactly the "all cards
+   look alarming" state this section exists to end. Neutral by default; the
+   colour arrives with data-risk, same as everything else on the card. */
+.portty-agent-permission code {
+  display: block;
+  color: var(--text-1);
+}
+.portty-agent-permission[data-risk] code {
+  color: var(--red-100);
+}
+.portty-agent-permission-title {
+  margin-top: 0.5rem;
+  font-size: 0.82rem;
+  word-break: break-word;
+}
+/* Category badge - encodes the RISK of the action in text + color so
+   execute/network/destructive read at a glance, distinct from read/write. */
+.portty-agent-permission-cat {
+  font-family: var(--mono);
+  font-size: 0.62rem;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  padding: 0.12rem 0.4rem;
+  border-radius: 0.35rem;
+  border: 1px solid var(--border);
+  color: var(--text-2);
+}
+/* read / write / execute / network are what an agent does all day. The chip
+   still NAMES them - the word "EXECUTE" is the signal - but it no longer
+   colours them, because a colour every card wears tells the user nothing.
+   The base .portty-agent-permission-cat rule above already renders neutral,
+   so these four deliberately have no override at all.
+
+   destructive / unknown keep red: those are the categories where the tier
+   system itself is saying it cannot vouch for the operation. */
+.portty-agent-permission-cat[data-cat="destructive"],
+.portty-agent-permission-cat[data-cat="unknown"] {
+  border-color: rgba(239, 68, 68, 0.6);
+  background: rgb(var(--red-deep-rgb) / 0.25);
+  color: var(--red-100);
+}
+.portty-agent-permission-session {
+  font-size: 0.68rem;
+  max-width: 40%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+/* The raw command / args / cwd being approved. Monospace, dim panel, capped +
+   scrollable so a long payload can't push the action buttons off-screen. */
+.portty-agent-permission-detail {
+  margin: 0.5rem 0 0;
+  padding: 0.5rem 0.6rem;
+  max-height: 9rem;
+  overflow: auto;
+  border-radius: 0.5rem;
+  border: 1px solid var(--border);
+  background: rgba(0, 0, 0, 0.35);
+  color: var(--text-2);
+  font-family: var(--mono);
+  font-size: 0.72rem;
+  line-height: 1.45;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.portty-agent-permission-actions,
+.portty-agent-permission-grants {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0.5rem;
+  margin-top: 0.7rem;
+}
+/* The grants sit inside the scrolling body, so they need a little breathing
+   room from the pinned row that follows them. */
+.portty-agent-permission-grants {
+  margin-bottom: 0.35rem;
+}
+.portty-agent-permission-actions button,
+.portty-agent-permission-grants button {
+  min-height: 2.75rem;
+  border-radius: 0.7rem;
+  border: 1px solid var(--border);
+  background: var(--surface-2);
+  color: var(--text-2);
+  font-size: 0.78rem;
+  font-weight: 700;
+  touch-action: manipulation;
+}
+/* Outlines, not fills. A solid glowing lime "Allow" made approval the most
+   attractive thing on a security prompt, and paired it against a red-tinted
+   "Reject" that read as the discouraged option - the exact opposite of the
+   weighting this card wants. Both are now equal-weight outlines and the user
+   has to read the label rather than follow the colour. Lime stays as the
+   brand accent elsewhere; it is not an argument for approving. */
+.portty-agent-permission-actions button.is-allow {
+  border-color: rgba(255, 255, 255, 0.22);
+  background: transparent;
+  color: var(--text-1);
+}
+.portty-agent-permission-actions button.is-reject {
+  border-color: rgba(255, 255, 255, 0.12);
+  background: transparent;
+  color: var(--text-2);
+}
+/* On a risky card approving IS the dangerous act, so it stops looking like
+   the neutral default and takes the warning colour itself. */
+.portty-agent-permission[data-risk] .portty-agent-permission-actions button.is-allow {
+  border-color: rgb(var(--red-rgb) / 0.6);
+  color: var(--red-300);
+}
+/* Credential-shaped path: raised regardless of tier, so it has to look
+   different from routine approvals. RED, not amber - it used to share amber
+   with the standing-grant warning on the reasoning that "unusual should read
+   the same way everywhere", but sharing one colour between "this might be a
+   secret" and "this grant is permanent" meant neither could outrank the
+   other. Amber now means exactly one thing on this card (an irreversible
+   grant); risk to a secret is red. */
+.portty-agent-permission-sensitive {
+  display: flex;
+  gap: 0.4rem;
+  align-items: flex-start;
+  margin: 0.35rem 0 0;
+  padding: 0.45rem 0.55rem;
+  border: 1px solid rgb(var(--red-rgb) / 0.5);
+  border-radius: 0.5rem;
+  background: rgb(var(--red-deep-rgb) / 0.26);
+  color: var(--red-100);
+  font-size: 0.72rem;
+  line-height: 1.35;
+}
+.portty-agent-permission-sensitive svg {
+  flex: none;
+  width: 0.95rem;
+  height: 0.95rem;
+  margin-top: 0.1rem;
+}
+
+/* Why a tier is not being applied: the agent's sandbox root is the home folder
+   or wider. Deliberately AMBER, not the red of the credential warning - this is
+   a misconfiguration to fix, not a secret about to leave the machine, and
+   colouring the two the same would flatten a distinction the user needs.
+   The icon carries the same meaning for anyone who cannot separate the hues. */
+.portty-agent-permission-scope {
+  display: flex;
+  gap: 0.4rem;
+  align-items: flex-start;
+  margin: 0.35rem 0 0;
+  padding: 0.45rem 0.55rem;
+  border: 1px solid color-mix(in srgb, var(--amber) 50%, transparent);
+  border-radius: 0.5rem;
+  background: color-mix(in srgb, var(--amber) 12%, transparent);
+  color: var(--text-1);
+  font-size: 0.72rem;
+  line-height: 1.35;
+}
+.portty-agent-permission-scope svg {
+  flex: none;
+  width: 0.95rem;
+  height: 0.95rem;
+  margin-top: 0.1rem;
+}
+
+/* A provider-wide "always" grant must never read like a one-time answer. The
+   adapter names these buttons and decides what "always" covers, so the card
+   spells out the scope in words and gives the grant a full-width row of its own,
+   where it cannot be tapped by reflex next to "Allow".
+
+   It carries NO colour at rest. A filled amber block made the grant the loudest
+   thing on a card whose entire premise is that colour is spent only on real
+   risk - and it spent that colour on merely LOOKING at the option, which is
+   free. The scope caption says what it is; the arm/confirm below is what costs
+   something, and that is where the amber goes. */
+.portty-agent-permission button.is-standing {
+  grid-column: 1 / -1;
+  display: flex;
+  flex-direction: column;
+  gap: 0.15rem;
+  align-items: flex-start;
+  text-align: left;
+  border-color: var(--border-strong);
+  background: var(--surface-2);
+  color: var(--text-1);
+}
+.portty-agent-permission button.is-standing .portty-agent-permission-scope {
+  color: var(--text-3);
+}
+/* Armed: THIS is the tap that hands over an open-ended grant, so this is the
+   one moment the control is allowed to shout. An outline and a wash rather than
+   a fill - loud enough to stop a reflex, quiet enough to still read. */
+.portty-agent-permission button.is-standing.is-armed {
+  border-color: rgba(251, 191, 36, 0.9);
+  background: rgba(251, 191, 36, 0.1);
+  color: #fde68a;
+}
+.portty-agent-permission button.is-standing.is-armed .portty-agent-permission-scope {
+  color: var(--amber);
+}
+.portty-agent-permission-scope {
+  font-family: var(--mono);
+  font-size: 0.62rem;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  opacity: 0.85;
+  text-transform: uppercase;
+}
+/* The exact grant is NARROWER than the agent-wide one above it, so it must never
+   be louder. In blue it was the most prominent control on the card - which put
+   the strongest visual pull on a persistent grant, and inverted the hierarchy
+   between the two grants. Same neutral surface as its sibling; the canonical
+   input line below is what distinguishes it, and that is information rather
+   than decoration. */
+.portty-agent-permission button.is-exact {
+  grid-column: 1 / -1;
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+  align-items: flex-start;
+  text-align: left;
+  border-color: var(--border-strong);
+  background: var(--surface-2);
+  color: var(--text-1);
+}
+.portty-agent-permission button.is-exact code.portty-agent-permission-exact {
+  display: block;
+  color: var(--text-3);
+  font-family: var(--mono);
+  font-size: 0.66rem;
+  font-weight: 500;
+  opacity: 0.85;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+/* On a credential or destructive card every other control turns red, and a
+   calm blue button in the middle of them read as the safe, recommended one -
+   on the card where the recommended answer is least likely to be "yes, and
+   remember it". The exact grant is narrower than the agent-wide grant above it,
+   so it stays visually distinct, but it carries the card's risk like the rest. */
+/* Both grants cascade together. Tinting only one of them puts the softer look
+   on whichever was left out - and on a credential card that briefly made the
+   AGENT-WIDE grant read as the safer of the two, which is backwards. */
+.portty-agent-permission[data-risk] button.is-exact,
+.portty-agent-permission[data-risk] button.is-standing {
+  border-color: rgb(var(--red-rgb) / 0.5);
+  background: rgb(var(--red-deep-rgb) / 0.28);
+  color: var(--red-100);
+}
+.portty-agent-permission[data-risk] button.is-standing .portty-agent-permission-scope {
+  color: var(--red-300);
+}
+/* Armed stays amber even on a risk card: red says "this action is dangerous",
+   amber says "this grant is permanent". They are different warnings and the
+   card is deliberately able to show both at once. */
+.portty-agent-permission[data-risk] button.is-standing.is-armed {
+  border-color: rgba(251, 191, 36, 0.9);
+  background: rgba(251, 191, 36, 0.12);
+  color: #fde68a;
+}
+.portty-agent-permission[data-risk] button.is-standing.is-armed .portty-agent-permission-scope {
+  color: var(--amber);
+}
+.portty-agent-permission[data-risk] button.is-exact code.portty-agent-permission-exact {
+  color: var(--red-100);
+}
+/* Disclosure for the grants that outlive this decision. Deliberately plain -
+   it is a way IN to a consequential choice, not a choice itself, so it must not
+   compete with Allow and Reject above it. */
+.portty-agent-permission-actions button.is-grants {
+  grid-column: 1 / -1;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+  border-color: var(--border);
+  background: transparent;
+  color: var(--text-3);
+  font-size: 0.74rem;
+}
+.portty-agent-permission-actions button.is-grants .portty-icon {
+  flex: none;
+  width: 0.9rem;
+  height: 0.9rem;
+}
+.portty-agent-permission-actions button:active {
+  transform: scale(0.97);
+}
+.portty-agent-replaying {
+  align-self: center;
+  color: var(--text-3);
+  font-family: var(--mono);
+  font-size: 0.72rem;
+}
+.portty-agent-auth {
+  display: flex;
+  align-items: center;
+  gap: 0.8rem;
+  padding: 0.8rem;
+  border: 1px solid rgba(250, 204, 21, 0.32);
+  border-radius: var(--radius-md);
+  background: rgba(113, 63, 18, 0.16);
+}
+.portty-agent-auth div { flex: 1; min-width: 0; }
+.portty-agent-auth p { margin: 0.25rem 0 0; color: var(--text-3); font-size: 0.72rem; }
+.portty-agent-auth button {
+  border: 1px solid rgba(250, 204, 21, 0.4);
+  border-radius: 0.65rem;
+  padding: 0.55rem 0.7rem;
+  background: rgba(250, 204, 21, 0.12);
+  color: #fde68a;
+}
+/* ââ Agent settings sheet (gear) âââââââââââââââââââ
+   Was a horizontal scroller pinned above the composer. On a phone that meant
+   permanently spending a row of the conversation on controls you change rarely,
+   with the tail of them - including the context counter - running off the right
+   edge where they could not be read at all.
+
+   Now it drops from the gear as a STACKED list: every row on its own line, label
+   left, control right, nothing clipped. Capped so a long option list scrolls
+   inside the sheet rather than swallowing the feed. */
+.portty-agent-settings {
+  flex: 0 0 auto;
+  display: flex;
+  flex-direction: column;
+  gap: 0.55rem;
+  padding: 0.75rem 0.85rem;
+  border-bottom: 1px solid var(--border);
+  background: rgba(11, 11, 13, 0.97);
+  max-height: 45vh;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+.portty-agent-settings label {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+  color: var(--text-3);
+  font-family: var(--mono);
+  font-size: 0.74rem;
+}
+.portty-agent-settings select {
+  /* min-width:0 lets a long model name ellipsize instead of forcing the row
+     wider than the sheet - "Z.AI Coding Plan/GL" was what overflowed before. */
+  min-width: 0;
+  max-width: 62%;
+  border: 1px solid var(--border-strong);
+  border-radius: 0.55rem;
+  padding: 0.4rem 0.5rem;
+  background: var(--surface-2);
+  color: var(--text-1);
+  font: inherit;
+}
+.portty-agent-config-toggle input { accent-color: var(--lime); }
+.portty-agent-usage-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+  padding-top: 0.5rem;
+  border-top: 1px solid var(--border);
+  color: var(--text-3);
+  font-family: var(--mono);
+  font-size: 0.74rem;
+}
+.portty-agent-usage {
+  color: var(--text-2);
+  font-family: var(--mono);
+  font-size: 0.74rem;
+  white-space: nowrap;
+}
+/* Pressed state for a header icon button that owns an open panel. */
+.portty-icon-btn-on {
+  border-color: rgb(var(--lime-rgb) / 0.4);
+  background: rgb(var(--lime-rgb) / 0.12);
+  color: var(--lime-bright);
+}
+.portty-agent-composer {
+  position: relative;
+  flex: 0 0 auto;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 2.7rem;
+  align-items: end;
+  gap: 0.55rem;
+  padding: 0.7rem 0.8rem calc(0.7rem + env(safe-area-inset-bottom, 0px));
+  border-top: 1px solid var(--border);
+  background: linear-gradient(180deg, rgba(14, 14, 16, 0.88), rgba(7, 7, 8, 0.98));
+  backdrop-filter: blur(16px);
+  -webkit-backdrop-filter: blur(16px);
+}
+.portty-agent-command-menu {
+  position: absolute;
+  z-index: 4;
+  right: 0.8rem;
+  bottom: calc(100% + 0.35rem);
+  left: 0.8rem;
+  display: flex;
+  max-height: 14rem;
+  flex-direction: column;
+  overflow-y: auto;
+  border: 1px solid var(--border-strong);
+  border-radius: 0.8rem;
+  background: rgba(16, 17, 19, 0.98);
+  box-shadow: 0 14px 40px rgba(0, 0, 0, 0.42);
+}
+/* Each row is a STACK, not a two-column grid. Every button was its own grid
+   with an `auto` first column, so each row sized that column from its own
+   command name - and the descriptions came out with a ragged left edge all the
+   way down the list. One left edge, name over description. */
+.portty-agent-composer .portty-agent-command-menu button {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 0.12rem;
+  width: auto;
+  height: auto;
+  padding: 0.6rem 0.75rem;
+  border-radius: 0;
+  border-bottom: 1px solid var(--border);
+  background: transparent;
+  color: var(--text-1);
+  text-align: left;
+  box-shadow: none;
+}
+.portty-agent-composer .portty-agent-command-menu button:last-child { border-bottom: 0; }
+.portty-agent-composer .portty-agent-command-menu button:active {
+  background: rgb(var(--lime-rgb) / 0.09);
+}
+.portty-agent-command-line {
+  display: flex;
+  align-items: baseline;
+  gap: 0.4rem;
+  min-width: 0;
+}
+.portty-agent-command-line strong {
+  color: var(--lime-bright);
+  font-family: var(--mono);
+  font-size: 0.82rem;
+  font-weight: 650;
+}
+/* The argument placeholder belongs beside the name it applies to - as a hint of
+   what to type next, not stranded on its own line under the description. */
+.portty-agent-command-line small {
+  color: var(--text-3);
+  font-family: var(--mono);
+  font-size: 0.68rem;
+  font-style: italic;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.portty-agent-command-desc {
+  min-width: 0;
+  color: var(--text-2);
+  font-size: 0.73rem;
+  line-height: 1.35;
+  /* Two lines maximum: a verbose agent description must not push the rest of the
+     list out of a menu that is already capped at 14rem. */
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+.portty-agent-composer textarea {
+  min-height: 2.7rem;
+  max-height: 8rem;
+  resize: none;
+  padding: 0.72rem 0.8rem;
+  border: 1px solid var(--border-strong);
+  border-radius: 0.82rem;
+  background: #111214;
+  color: var(--text-1);
+  font-family: inherit;
+  font-size: 0.86rem;
+  line-height: 1.35;
+}
+.portty-agent-composer textarea:focus {
+  outline: none;
+  border-color: var(--lime-deep);
+  box-shadow: 0 0 0 3px rgb(var(--lime-rgb) / 0.1);
+}
+.portty-agent-composer button {
+  display: grid;
+  place-items: center;
+  width: 2.75rem;
+  height: 2.75rem;
+  border: none;
+  border-radius: 0.82rem;
+  background: linear-gradient(180deg, var(--lime-bright), var(--lime-deep));
+  color: #0a0f00;
+  font-size: 1.2rem;
+  font-weight: 800;
+  box-shadow: 0 4px 16px rgb(var(--lime-rgb) / 0.2);
+}
+.portty-agent-composer button > .portty-icon {
+  width: 1.15rem;
+  height: 1.15rem;
+}
+/* Primary button while a turn streams: the urgent action, in the thumb zone. */
+.portty-agent-composer button.portty-agent-send-stop {
+  background: rgb(var(--red-deep-rgb) / 0.42);
+  border: 1px solid rgba(239, 68, 68, 0.6);
+  color: var(--red-100);
+  box-shadow: none;
+  font-size: 0.95rem;
+}
+.portty-agent-composer button:disabled,
+.portty-agent-composer textarea:disabled {
+  opacity: 0.5;
+}
+
+/* Provider picker under the home actions. */
+.portty-new-agent-btn {
+  color: var(--lime-bright);
+  border-color: rgb(var(--lime-rgb) / 0.24);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.45rem;
+}
+.portty-btn-icon {
+  flex: 0 0 auto;
+  width: 1.05rem;
+  height: 1.05rem;
+}
+.portty-agent-picker {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0.45rem;
+  margin-top: 0.5rem;
+}
+.portty-agent-picker button {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  align-items: center;
+  gap: 0.35rem;
+  padding: 0.65rem 0.2rem;
+  border: 1px solid var(--border);
+  border-radius: 0.7rem;
+  background: var(--surface-2);
+  color: var(--text-2);
+  font-size: 0.72rem;
+  font-weight: 650;
+  touch-action: manipulation;
+}
+/* The provider tile's letter badge. This was `.portty-agent-picker button span`,
+   which is every span in the picker - so the saved-conversation rows further
+   down inherited a 1.65rem square grid box and their text (the prompt, and the
+   "Codex · 14m ago" meta) collapsed into overlapping 26px tiles. Scoped to the
+   badge itself; the class is what makes it a badge, not its position. */
+.portty-agent-picker button .portty-agent-picker-glyph {
+  display: grid;
+  place-items: center;
+  width: 1.65rem;
+  height: 1.65rem;
+  border-radius: 0.52rem;
+  background: rgb(var(--lime-rgb) / 0.1);
+  border: 1px solid rgb(var(--lime-rgb) / 0.2);
+  color: var(--lime-bright);
+  font-family: var(--mono);
+  font-weight: 800;
+}
+/* An agent this host cannot launch. Dimmed rather than hidden: knowing Claude
+   Code EXISTS and needs installing is more useful than it silently not being
+   there, which reads as Portty not supporting it at all. */
+.portty-agent-picker button.is-unavailable {
+  opacity: 0.45;
+}
+.portty-agent-picker button.is-unavailable .portty-agent-picker-glyph {
+  background: rgba(148, 163, 184, 0.1);
+  border-color: rgba(148, 163, 184, 0.2);
+  color: var(--text-3);
+}
+.portty-agent-picker-note {
+  font-family: var(--mono);
+  font-size: 0.58rem;
+  font-weight: 500;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--text-3);
+}
+.portty-agent-picker button:active {
+  transform: scale(0.97);
+  border-color: var(--border-strong);
+}
+
+/* ── Agent workspace picker ────────────────────────────────────────────
+   Step two of starting an agent: WHERE it runs. The chosen directory is also
+   the agent's file-access sandbox root, so this is a security control as much
+   as a convenience - which is why the resolved path is always on screen before
+   "Start here" is reachable.
+
+   It spans both columns of the provider grid and re-styles the buttons it
+   inherits from `.portty-agent-picker button` (column-flex chips) into
+   full-width rows. */
+.portty-dir-picker {
+  grid-column: 1 / -1;
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+/* Root switcher: Workspace | Home. Segmented rather than a dropdown because there
+   are two of them and a native select on Android takes over the screen. */
+.portty-dir-roots {
+  display: flex;
+  gap: 0.25rem;
+  padding: 0.2rem;
+  border-radius: 0.55rem;
+  background: rgb(var(--lime-rgb) / 0.06);
+}
+.portty-agent-picker .portty-dir-root {
+  flex: 1;
+  min-height: 2rem;
+  padding: 0 0.5rem;
+  border: none;
+  border-radius: 0.4rem;
+  background: transparent;
+  color: var(--text-2);
+  font-size: 0.75rem;
+  font-weight: 600;
+  text-align: center;
+}
+.portty-agent-picker .portty-dir-root--on {
+  background: rgb(var(--lime-rgb) / 0.16);
+  color: var(--lime-bright);
+}
+/* The line that says what the star does. Quiet, and directly under the row it
+   refers to, so it reads as a caption rather than a warning. */
+.portty-dir-hint {
+  margin: -0.15rem 0 0;
+  padding-inline: 0.15rem;
+  color: var(--text-2);
+  font-size: 0.68rem;
+  line-height: 1.4;
+}
+/* The default-folder toggle, inside the "you are here" row. Pushed to the far
+   end so the folder name keeps the space it needs, and given a full 2.25rem box
+   because it is a tap target on a row of text. */
+.portty-agent-picker .portty-dir-star {
+  flex: none;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 2.25rem;
+  min-height: 2.25rem;
+  margin-inline-start: auto;
+  /* Negative inline padding pull-in: the row is tight, and the icon should sit at
+     its edge without widening the row. */
+  margin-inline-end: -0.25rem;
+  padding: 0;
+  border: none;
+  border-radius: 0.5rem;
+  background: transparent;
+  color: var(--text-2);
+}
+/* Starred: filled, and in the accent so "this is the one" reads at a glance
+   rather than depending on noticing an outline changed. */
+.portty-agent-picker .portty-dir-star--on {
+  color: var(--lime-bright);
+}
+.portty-agent-picker .portty-dir-star--on .portty-icon {
+  /* Overrides the svg's own fill="none" attribute - CSS wins over presentation
+     attributes, which is what lets one glyph serve both states. */
+  fill: currentColor;
+}
+.portty-agent-picker .portty-dir-star:active {
+  background: rgb(var(--lime-rgb) / 0.12);
+}
+.portty-dir-path {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  padding: 0.5rem 0.6rem;
+  border-radius: 0.6rem;
+  background: rgb(var(--lime-rgb) / 0.08);
+  border: 1px solid rgb(var(--lime-rgb) / 0.2);
+  color: var(--lime-bright);
+  font-family: var(--mono);
+  font-size: 0.72rem;
+}
+.portty-dir-path-text {
+  /* Shrinks so a deep path truncates instead of shoving the trailing control
+     (the default-folder star) off the row. */
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  /* A deep path truncates at the FRONT: the tail is the folder you're choosing,
+     and that is the part that must stay readable. */
+  direction: rtl;
+  text-align: left;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+/* A failure should read as a sentence with a heading, not a dumped error
+   string. Left rule instead of a full red box: this is information the user has
+   to ACT on, and a wall of red reads as "something broke" rather than "here is
+   what to do next". */
+.portty-dir-error {
+  display: flex;
+  flex-direction: column;
+  gap: 0.2rem;
+  padding: 0.5rem 0.65rem;
+  border-radius: 0.5rem;
+  border: 1px solid rgb(var(--red-rgb) / 0.22);
+  border-left: 2px solid rgb(var(--red-rgb) / 0.75);
+  background: rgb(var(--red-rgb) / 0.07);
+}
+.portty-dir-error strong {
+  color: var(--red-300);
+  font-size: 0.78rem;
+  font-weight: 650;
+}
+.portty-dir-error span {
+  color: var(--text-2);
+  font-size: 0.72rem;
+  line-height: 1.45;
+  /* Long identifiers (adapter names, env vars) must wrap rather than force the
+     sheet wider than the screen. */
+  overflow-wrap: anywhere;
+}
+.portty-dir-list {
+  display: flex;
+  flex-direction: column;
+  gap: 0.3rem;
+  /* Bounded so a workspace with many folders can't push "Start here" off the
+     bottom of the sheet - the commit action must always be reachable. */
+  max-height: 40vh;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+/* One folder = the name (navigates) plus an optional trailing control (the
+   default-folder star). A row rather than a single button because the control
+   cannot be a button nested inside a button. The agent picker passes no control,
+   so its rows hold only the name and look exactly as they did. */
+.portty-dir-row {
+  display: flex;
+  align-items: center;
+  gap: 0.15rem;
+}
+.portty-dir-row .portty-dir-entry {
+  /* Takes the row, so the name is the big target and the star keeps its own. */
+  flex: 1;
+  min-width: 0;
+}
+.portty-agent-picker .portty-dir-entry {
+  flex-direction: row;
+  align-items: center;
+  justify-content: flex-start;
+  gap: 0.45rem;
+  padding: 0.55rem 0.65rem;
+  color: var(--text-1);
+  font-size: 0.78rem;
+  font-weight: 550;
+  text-align: left;
+}
+.portty-agent-picker .portty-dir-up {
+  color: var(--text-2);
+}
+.portty-dir-empty {
+  padding: 0.5rem 0.65rem;
+  color: var(--text-2);
+  font-size: 0.72rem;
+}
+/* Saved conversations for the directory in view. Sits between the folder list
+   and the actions so the sheet reads in order: where → which conversation → or
+   start fresh. */
+.portty-dir-saved {
+  display: flex;
+  flex-direction: column;
+  gap: 0.3rem;
+  padding-top: 0.5rem;
+  border-top: 1px solid var(--border);
+  max-height: 32vh;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+.portty-dir-saved h3 {
+  margin: 0 0 0.1rem 0.15rem;
+  font-size: 0.62rem;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--text-3);
+}
+/* align-items:flex-start sized both children to their own content instead of the
+   row, and a -webkit-box has almost no intrinsic width - so the prompt and the
+   "Codex · 14m ago" meta both collapsed to 26px squares and their text spilled
+   out on top of each other. Stretch is what a stacked row wants; flex-start was
+   only ever suppressing a horizontal stretch that a column does not do anyway. */
+.portty-agent-picker .portty-dir-session {
+  flex-direction: column;
+  align-items: stretch;
+  gap: 0.15rem;
+  padding: 0.5rem 0.65rem;
+  color: var(--text-1);
+  text-align: left;
+}
+.portty-dir-session-label {
+  /* The first prompt, clamped: it is a whole user message, and left unbounded a
+     long one would push the actions out of reach. */
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  /* The clamp needs a resolved width to wrap against; without this the box
+     measures its longest word and clips everything else. */
+  width: 100%;
+  min-width: 0;
+  font-size: 0.78rem;
+  font-weight: 550;
+  line-height: 1.35;
+}
+.portty-dir-session-meta {
+  color: var(--text-3);
+  font-family: var(--mono);
+  font-size: 0.66rem;
+}
+/* The wait while the host asks the agent what it remembers. Sits BELOW the rows
+   already on screen, because Portty's own cached conversations arrive first and
+   pushing them down to announce that more may follow would be the wrong way
+   round. */
+.portty-dir-saved-note {
+  margin: 0.15rem 0 0 0.15rem;
+  color: var(--text-3);
+  font-size: 0.68rem;
+  line-height: 1.35;
+}
+.portty-dir-actions {
+  display: flex;
+  gap: 0.5rem;
+}
+.portty-dir-actions button {
+  flex: 1 1 0;
+}

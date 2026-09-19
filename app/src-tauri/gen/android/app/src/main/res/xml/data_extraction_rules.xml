@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Android 12+ (API 31+) backup/transfer policy.
+     Portty's only meaningful persisted state is the device identity
+     (identity.bin) and reconnect credentials (portty-peers.dat). A copied
+     identity is a copied credential, so it must never leave the device - we
+     exclude the whole private files domain from BOTH cloud backup and
+     device-to-device transfer. `allowBackup="false"` covers older APIs. -->
+<data-extraction-rules>
+    <cloud-backup>
+        <exclude domain="file" />
+        <exclude domain="database" />
+        <exclude domain="sharedpref" />
+        <exclude domain="external" />
+    </cloud-backup>
+    <device-transfer>
+        <exclude domain="file" />
+        <exclude domain="database" />
+        <exclude domain="sharedpref" />
+        <exclude domain="external" />
+    </device-transfer>
+</data-extraction-rules>

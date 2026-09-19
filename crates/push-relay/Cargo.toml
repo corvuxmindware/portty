@@ -1,0 +1,36 @@
+[package]
+name = "portty-push-relay"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Blind, self-hostable wake-only push relay for Portty"
+
+[dependencies]
+axum = "0.8"
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = "1"
+# `http2` is load-bearing: APNs' provider API is HTTP/2-only. Without the
+# feature reqwest speaks HTTP/1.1 and every APNs send fails at the socket.
+# `rustls-no-provider`, not `rustls`: reqwest 0.13 renamed the old `rustls-tls`
+# feature, and plain `rustls` now drags in aws-lc-rs - a second native crypto
+# stack (and NASM on Windows). Stay single-stack on ring and install the process
+# provider explicitly before any client is built.
+# `form` is new here only because reqwest 0.13 split it out of the default set;
+# the FCM service-account OAuth exchange posts a urlencoded form.
+reqwest = { version = "0.13", default-features = false, features = ["json", "form", "rustls-no-provider", "http2"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "logging", "tls12"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+subtle = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+zeroize = { workspace = true }
+async-trait = { workspace = true }
+jsonwebtoken = { version = "9.3.1", default-features = false, features = ["use_pem"] }
+base64 = "0.22"
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"

@@ -1,0 +1,62 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <!-- The capability token is NOT in this page - app.js reads it from the URL's
+       ?token= query (the host prints the full URL to the owner's terminal), so
+       another local process fetching `/` learns nothing. -->
+  <title>Portty - local proof</title>
+  <link rel="stylesheet" href="/xterm.css" />
+  <style>
+    :root { color-scheme: dark; }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0; font-family: system-ui, sans-serif; background: #0b0e14; color: #c9d1d9;
+      display: flex; flex-direction: column; height: 100vh;
+    }
+    header {
+      display: flex; align-items: center; gap: 12px; padding: 8px 12px;
+      border-bottom: 1px solid #1f242d; background: #11151c;
+    }
+    header .logo { font-weight: 700; letter-spacing: .5px; color: #7ee787; }
+    header .sub { font-size: 12px; opacity: .6; }
+    #tabs { display: flex; gap: 6px; margin-left: auto; flex-wrap: wrap; }
+    .tab {
+      display: inline-flex; align-items: center; gap: 6px; cursor: pointer;
+      padding: 4px 10px; border-radius: 6px; background: #1b212c; border: 1px solid #262d39;
+      font-size: 13px; user-select: none;
+    }
+    .tab:hover { background: #232b38; }
+    .tab.active { background: #2f7d4f; border-color: #4ea66c; color: #fff; }
+    .tab .dot {
+      width: 8px; height: 8px; border-radius: 50%; background: transparent;
+    }
+    .tab.has-activity .dot { background: #f0b429; box-shadow: 0 0 6px #f0b429; }
+    .tab .x { opacity: .5; padding: 0 2px; }
+    .tab .x:hover { opacity: 1; color: #ff7b72; }
+    main { flex: 1; padding: 8px; overflow: hidden; }
+    #term { height: 100%; }
+    footer { padding: 4px 12px; font-size: 11px; opacity: .45; border-top: 1px solid #1f242d; }
+    #newbtn {
+      cursor: pointer; padding: 4px 10px; border-radius: 6px; font-size: 13px;
+      background: #1b212c; border: 1px solid #262d39; color: #c9d1d9;
+    }
+    #newbtn:hover { background: #232b38; }
+  </style>
+</head>
+<body>
+  <header>
+    <span class="logo">⌁ Portty</span>
+    <span class="sub">local proof - floor (PTY + xterm.js + switch)</span>
+    <div id="tabs"></div>
+    <button id="newbtn">+ new</button>
+  </header>
+  <main><div id="term"></div></main>
+  <footer id="status">connecting…</footer>
+
+  <script src="/xterm.js"></script>
+  <script src="/xterm-addon-fit.js"></script>
+  <script src="/app.js"></script>
+</body>
+</html>

@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Shared Apple Info.plist additions. Tauri auto-discovers this file next to
+  tauri.conf.json and merges it into the generated bundle Info.plist for both
+  the macOS desktop build and the iOS build (see gen/apple/portty-app_iOS/Info.plist).
+
+  QrScanner.tsx calls getUserMedia({video}) to scan a host's pairing QR code.
+  Without this usage string, iOS/macOS silently deny the camera request
+  (crashes on some iOS versions) instead of showing the permission prompt.
+  Lifted from Corvux's identical fix (Corvux/src-tauri/Info.plist).
+-->
+<plist version="1.0">
+<dict>
+	<key>NSCameraUsageDescription</key>
+	<string>Portty uses the camera only when you tap "Scan QR code" to pair with a host. It reads the pairing ticket shown on your computer - nothing is recorded or saved.</string>
+	<!--
+	  Local-network access. Portty pairs a phone with a host and, when both are on
+	  the same Wi-Fi, connects LAN-direct (iroh) instead of via a relay - iOS 14+
+	  requires this usage string + a user grant for that. It ALSO lets `tauri ios
+	  dev` on a physical device reach the Mac's dev server (plain-HTTP over the LAN),
+	  which ATS otherwise blocks (black screen). NSAllowsLocalNetworking scopes the
+	  ATS exemption to private-range IPs / .local only - App-Store-safe, not a
+	  blanket NSAllowsArbitraryLoads.
+	-->
+	<key>NSLocalNetworkUsageDescription</key>
+	<string>Portty connects directly to a paired host on your local network when both are on the same Wi-Fi, for a faster terminal link.</string>
+	<key>NSAppTransportSecurity</key>
+	<dict>
+		<key>NSAllowsLocalNetworking</key>
+		<true/>
+	</dict>
+</dict>
+</plist>

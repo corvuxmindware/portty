@@ -1,0 +1,8 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "mobile",
+  "description": "Mobile-only capability (Android + iOS). Carries the biometric app-lock and local-notification permissions; desktop never references them (neither plugin is wired for a desktop backend here), so `pnpm tauri dev` stays clean.",
+  "platforms": ["android", "iOS"],
+  "windows": ["main"],
+  "permissions": ["biometric:default", "notification:default"]
+}

@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- Release/TestFlight/App Store builds MUST declare the PRODUCTION APNs
+	     environment, or every distributed build registers a sandbox token and
+	     the relay's POST to api.push.apple.com returns BadDeviceToken (the
+	     doorbell silently never fires). Debug builds use the sibling
+	     portty-app_iOS.entitlements with aps-environment=development. -->
+	<key>aps-environment</key>
+	<string>production</string>
+</dict>
+</plist>

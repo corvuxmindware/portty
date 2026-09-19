@@ -1,0 +1,67 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Portty host as a per-user LaunchAgent (macOS).
+
+  Install:
+    1. Edit ProgramArguments below to your portty-host path (`which portty-host`)
+       and set PORTTY_WORKSPACE to ONE PROJECT folder - not your home
+       directory. It is also the root an agent may read files inside, and the
+       phone refuses to auto-approve reads when that root is your whole home.
+    2. cp packaging/launchd/org.example.portty.plist ~/Library/LaunchAgents/
+    3. launchctl load  ~/Library/LaunchAgents/org.example.portty.plist
+       launchctl unload ~/Library/LaunchAgents/org.example.portty.plist   # to stop
+
+  PAIRING: prefer `portty pair` over the log. Once the agent is loaded, run
+    portty pair
+  which asks the running daemon for FRESH pairing material over the local IPC
+  endpoint and prints it to YOUR terminal - nothing lands in a file that outlives
+  the pairing.
+
+  The daemon starts with pairing CLOSED and prints NO pairing material, so the
+  log below carries no credential. It used to print a complete first-pair key on
+  every restart, and log files PERSIST - so a restart was an enrolment
+  opportunity for anyone who could read them.
+  Keep the log under your per-user ~/Library/Logs anyway (NOT /tmp, which is
+  world-readable on multi-user Macs):
+    tail -f ~/Library/Logs/portty-host.log
+
+  After pairing once, phones reconnect by token (no pairing material), so it just
+  works.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>org.example.portty</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/local/bin/portty-host</string>
+        <string>serve</string>
+    </array>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PORTTY_WORKSPACE</key>
+        <string>/Users/CHANGE_ME/CHANGE_ME_TO_A_PROJECT</string>
+    </dict>
+
+    <!-- Start at login and restart on crash. -->
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
+
+    <!-- Structured log destination. Per-user (~/Library/Logs), NOT /tmp: the
+         /tmp is world-readable and the log still carries session metadata.
+         Edit CHANGE_ME to your username. -->
+    <key>StandardOutPath</key>
+    <string>/Users/CHANGE_ME/Library/Logs/portty-host.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/CHANGE_ME/Library/Logs/portty-host.log</string>
+</dict>
+</plist>

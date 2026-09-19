@@ -1,0 +1,161 @@
+name: portty-app
+options:
+  bundleIdPrefix: org.example.portty
+  # Apple rejects any upload below 15.0 from Spring 2027, and 1.19 already came
+  # back with warning 90068 for sitting at 14.0. xcodegen turns this into
+  # IPHONEOS_DEPLOYMENT_TARGET for every configuration, and that build setting is
+  # what becomes MinimumOSVersion in the built Info.plist - there is no
+  # MinimumOSVersion key committed anywhere to bump by hand.
+  deploymentTarget:
+    iOS: 15.0
+fileGroups: [../../src]
+configs:
+  debug: debug
+  release: release
+settingGroups:
+  app:
+    base:
+      PRODUCT_NAME: Portty
+      PRODUCT_BUNDLE_IDENTIFIER: org.example.portty
+      DEVELOPMENT_TEAM: YOURTEAMID
+    configs:
+      debug:
+        CODE_SIGN_IDENTITY: Apple Development
+        CODE_SIGN_STYLE: Automatic
+      release:
+        CODE_SIGN_IDENTITY: Apple Development
+        CODE_SIGN_STYLE: Automatic
+targetTemplates:
+  app:
+    type: application
+    sources:
+      - path: Sources
+    scheme:
+      environmentVariables:
+        RUST_BACKTRACE: full
+        RUST_LOG: info
+    settings:
+      groups: [app]
+targets:
+  portty-app_iOS:
+    type: application
+    platform: iOS
+    sources:
+      - path: Sources
+      - path: Assets.xcassets
+      - path: portty-app_iOS
+      - path: assets
+        buildPhase: resources
+        type: folder
+      - path: LaunchScreen.storyboard
+    info:
+      path: portty-app_iOS/Info.plist
+      properties:
+        # Export compliance. Without this key App Store Connect holds EVERY
+        # TestFlight build behind a manual encryption questionnaire before any
+        # tester can install it.
+        #
+        # Declared false = "uses no NON-EXEMPT encryption". Portty does encrypt,
+        # but only with standard, published, non-proprietary algorithms
+        # (ChaCha20-Poly1305, Ed25519, X25519, HKDF, SHA-2, BLAKE3, and TLS 1.3
+        # via rustls/ring) for securing its own transport and pairing - no
+        # proprietary cipher and nothing offered to the user as a general
+        # encryption feature.
+        #
+        # Re-check this if Portty ever ships its own cipher or a user-facing
+        # encryption feature: it would then need `true` plus a granted
+        # ITSEncryptionExportComplianceCode (CCATS/ERN) from BIS.
+        ITSAppUsesNonExemptEncryption: false
+        LSRequiresIPhoneOS: true
+        # Direct LAN path to the host. These MUST live here, not hand-added to
+        # the generated Info.plist: xcodegen rewrites that file from this spec
+        # on every build, so a hand-edit is silently dropped - and without the
+        # usage description iOS 14+ denies local-network access outright,
+        # forcing every session onto the slower relay.
+        NSLocalNetworkUsageDescription: >-
+          Portty connects directly to a paired host on your local network when
+          both are on the same Wi-Fi, for a faster terminal link.
+        NSAppTransportSecurity:
+          NSAllowsLocalNetworking: true
+        NSCameraUsageDescription: >-
+          Portty uses the camera only when you tap "Scan QR code" to pair with
+          a host. It reads the pairing ticket shown on your computer -
+          nothing is recorded or saved.
+        NSFaceIDUsageDescription: >-
+          Portty uses Face ID only when you enable biometric app lock, so your
+          paired hosts and terminal sessions stay protected on this device.
+        UILaunchStoryboardName: LaunchScreen
+        UIRequiredDeviceCapabilities: [arm64, metal]
+        UISupportedInterfaceOrientations:
+          - UIInterfaceOrientationPortrait
+          - UIInterfaceOrientationLandscapeLeft
+          - UIInterfaceOrientationLandscapeRight
+        UISupportedInterfaceOrientations~ipad:
+          - UIInterfaceOrientationPortrait
+          - UIInterfaceOrientationPortraitUpsideDown
+          - UIInterfaceOrientationLandscapeLeft
+          - UIInterfaceOrientationLandscapeRight
+        CFBundleShortVersionString: 0.1.2
+        # Kept in step with `bundle.iOS.bundleVersion` in tauri.conf.json, which
+        # is what actually patches the built app. Bump BOTH for every upload -
+        # App Store Connect rejects a reused build number.
+        #
+        # These two drifted apart once already (project.yml sat at 0.1.0/1.16
+        # while tauri.conf.json and Info.plist were at 0.1.2/1.17, and the
+        # ios_release_config tests still asserted 1.14). `ios_release_config.rs`
+        # is what catches that now - it pins every copy, so a partial bump fails
+        # the build instead of shipping a mismatched archive.
+        CFBundleVersion: "1.27"
+    # NO target-level `entitlements:` block here. It looks like the obvious way
+    # to point at the debug file, but xcodegen turns it into a single
+    # CODE_SIGN_ENTITLEMENTS for EVERY configuration - silently outranking the
+    # per-config release override below. That is how distribution builds ended
+    # up signed with the debug entitlements: `aps-environment=production` was
+    # written, reviewed, and never actually reached a shipped binary. Both
+    # files are committed, so selecting them per config (further down) is all
+    # that is needed - and it is the only form that survives regeneration.
+    scheme:
+      environmentVariables:
+        RUST_BACKTRACE: full
+        RUST_LOG: info
+    settings:
+      base:
+        ENABLE_BITCODE: false
+        ARCHS: [arm64]
+        VALID_ARCHS: arm64 
+        LIBRARY_SEARCH_PATHS[arch=x86_64]: $(inherited) $(PROJECT_DIR)/Externals/x86_64/$(CONFIGURATION) $(SDKROOT)/usr/lib/swift $(DEVELOPER_DIR)/Toolchains/XcodeDefault.xctoolchain/usr/lib/swift/$(PLATFORM_NAME) $(DEVELOPER_DIR)/Toolchains/XcodeDefault.xctoolchain/usr/lib/swift-5.0/$(PLATFORM_NAME)
+        LIBRARY_SEARCH_PATHS[arch=arm64]: $(inherited) $(PROJECT_DIR)/Externals/arm64/$(CONFIGURATION) $(SDKROOT)/usr/lib/swift $(DEVELOPER_DIR)/Toolchains/XcodeDefault.xctoolchain/usr/lib/swift/$(PLATFORM_NAME) $(DEVELOPER_DIR)/Toolchains/XcodeDefault.xctoolchain/usr/lib/swift-5.0/$(PLATFORM_NAME)
+        ALWAYS_EMBED_SWIFT_STANDARD_LIBRARIES: true
+        EXCLUDED_ARCHS[sdk=iphoneos*]: x86_64
+      configs:
+        # Both configs set this EXPLICITLY. Release/TestFlight/App Store must use
+        # the PRODUCTION APNs environment, else distributed builds register
+        # sandbox tokens and api.push.apple.com answers BadDeviceToken - the
+        # doorbell just silently never fires. Verify after any xcodegen change:
+        #   grep -o 'CODE_SIGN_ENTITLEMENTS = [^;]*;' *.xcodeproj/project.pbxproj
+        # must show BOTH files, not the same one twice.
+        debug:
+          CODE_SIGN_ENTITLEMENTS: portty-app_iOS/portty-app_iOS.entitlements
+        release:
+          CODE_SIGN_ENTITLEMENTS: portty-app_iOS/portty-app_iOS.release.entitlements
+      groups: [app]
+    dependencies:
+      - framework: libapp.a
+        embed: false
+      - sdk: CoreGraphics.framework
+      - sdk: Metal.framework
+      - sdk: MetalKit.framework
+      - sdk: QuartzCore.framework
+      - sdk: Security.framework
+      - sdk: SystemConfiguration.framework
+      - sdk: UIKit.framework
+      - sdk: WebKit.framework
+      # Push doorbell (see Sources/portty-app/push_glue.mm)
+      - sdk: UserNotifications.framework
+    preBuildScripts:
+      - script: pnpm tauri ios xcode-script -v --platform ${PLATFORM_DISPLAY_NAME:?} --sdk-root ${SDKROOT:?} --framework-search-paths "${FRAMEWORK_SEARCH_PATHS:?}" --header-search-paths "${HEADER_SEARCH_PATHS:?}" --gcc-preprocessor-definitions "${GCC_PREPROCESSOR_DEFINITIONS:-}" --configuration ${CONFIGURATION:?} ${FORCE_COLOR} ${ARCHS:?}
+        name: Build Rust Code
+        basedOnDependencyAnalysis: false
+        outputFiles:
+          - $(SRCROOT)/Externals/x86_64/${CONFIGURATION}/libapp.a
+          - $(SRCROOT)/Externals/arm64/${CONFIGURATION}/libapp.a

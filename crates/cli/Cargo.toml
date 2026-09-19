@@ -1,0 +1,31 @@
+[package]
+name = "portty-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Portty relay CLI - `portty share` wraps a shell, mirrors it locally, and tees it to the daemon so a paired phone can watch and control it."
+
+[[bin]]
+name = "portty"
+path = "src/main.rs"
+
+[dependencies]
+portty-protocol = { path = "../protocol" }
+portable-pty = "0.9"
+crossterm = "0.29"
+anyhow = "1"
+tokio = { workspace = true }
+postcard = { workspace = true }
+qrcode = "0.14"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+# Prefer a lossless VT input stream for nested TUIs. Legacy consoles that do
+# not accept ENABLE_VIRTUAL_TERMINAL_INPUT fall back to crossterm key events.
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_System_Console",
+] }

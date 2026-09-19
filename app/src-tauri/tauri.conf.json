@@ -1,0 +1,42 @@
+{
+  "$schema": "https://raw.githubusercontent.com/tauri-apps/tauri/dev/crates/tauri-config-schema/schema.json",
+  "productName": "Portty",
+  "version": "0.1.2",
+  "identifier": "org.example.portty",
+  "build": {
+    "frontendDist": "../dist",
+    "devUrl": "http://localhost:1420",
+    "beforeDevCommand": "pnpm dev",
+    "beforeBuildCommand": "pnpm build"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "Portty",
+        "width": 420,
+        "height": 840,
+        "resizable": true,
+        "disableInputAccessoryView": true
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self' ipc: http://ipc.localhost; img-src 'self' data: asset: http://asset.localhost blob:; style-src 'self' 'unsafe-inline'; script-src 'self'; connect-src 'self' ipc: http://ipc.localhost"
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "category": "DeveloperTool",
+    "publisher": "Corvux Mindware",
+    "shortDescription": "Your terminal, on your phone.",
+    "longDescription": "Portty puts a computer's terminal sessions on your phone over a secure peer-to-peer channel - pair once, then watch and control your shells from anywhere.",
+    "icon": ["icons/icon.png"],
+    "iOS": {
+      "bundleVersion": "1.27",
+      "developmentTeam": "YOURTEAMID"
+    },
+    "android": {
+      "versionCode": 1007
+    }
+  }
+}

@@ -1,0 +1,9 @@
+# Files that Linux must execute have to keep LF endings.
+#
+# This repo is developed on Windows with core.autocrlf=true, so without these
+# rules git rewrites them to CRLF on checkout. A CRLF shebang makes Linux report
+# "bad interpreter: No such file or directory" - and the Docker build copies these
+# straight out of the Windows working tree, so the container runner would break on
+# a fresh clone while working fine on the machine that wrote it.
+*.sh text eol=lf
+scripts/runner/Dockerfile text eol=lf

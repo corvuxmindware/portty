@@ -1,0 +1,16 @@
+[package]
+name = "acp-probe"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Portty Phase 1 ACP proof - spawns an ACP agent over stdio, drives a session, and logs the first session/request_permission. Throwaway validation probe for the agent ceiling."
+
+[[bin]]
+name = "acp-probe"
+path = "src/main.rs"
+
+[dependencies]
+agent-client-protocol = "2"
+tokio = { workspace = true }
+anyhow = "1"

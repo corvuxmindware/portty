@@ -1,0 +1,38 @@
+[package]
+name = "portty-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+postcard = { version = "1", features = ["alloc"] }
+portty-protocol = { path = "../crates/protocol" }
+portty-transport = { path = "../crates/transport" }
+
+[[bin]]
+name = "frame_decode"
+path = "fuzz_targets/frame_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "handshake_decode"
+path = "fuzz_targets/handshake_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "ticket_decode"
+path = "fuzz_targets/ticket_decode.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]
+members = ["."]
