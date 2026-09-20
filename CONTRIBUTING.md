@@ -142,7 +142,8 @@ Use a short prefix and a hyphenated description:
 Pairing tickets, pairing phrases, PINs, identity keys, reconnect tokens, push
 secrets, signing keys, and provider credentials are live secret material. Do not
 paste them into issues, pull requests, logs, test fixtures, or screenshots. A
-pairing ticket is a complete key to the machine that produced it.
+pairing ticket can start an enrollment attempt while pairing is open, even
+though the host must still confirm the new phone.
 
 If you need to show output from `portty pair`, `portty-host peers`, or the
 `acp-probe` diagnostic, redact it first.

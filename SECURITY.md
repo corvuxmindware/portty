@@ -26,9 +26,10 @@ The report stays private between you and the maintainers until a fix is ready.
 - Steps to reproduce, ideally the smallest case that shows the problem.
 - Any proof-of-concept code or captured traffic.
 
-**Redact secrets before you send them.** Pairing tickets, pairing phrases,
-identity keys, reconnect tokens, and push credentials are live keys to a
-machine. We do not need a working one to understand your report.
+**Redact secrets before you send them.** Pairing tickets and phrases contain
+temporary enrollment credentials; identity keys, reconnect tokens, and push
+credentials are also sensitive. We do not need working values to understand
+your report.
 
 ## What we will do
 
@@ -77,9 +78,11 @@ These are known properties of the design, documented in the
 [security model](README.md#security-model-and-operational-guidance). Reporting
 them is not a vulnerability:
 
-- **A paired phone is trusted.** Pairing is a deliberate act that hands over
-  control of the machine. Anyone holding a pairing ticket, phrase, or QR code has
-  a complete key - that is the design, not a bug.
+- **A successfully paired phone is trusted.** Enrollment requires a fresh
+  ticket, a matching six-digit code on both devices, and explicit confirmation
+  on the host. A leaked ticket, phrase, or QR code can start an enrollment
+  attempt while pairing is open, but it cannot skip host confirmation. Once
+  approved, the phone can control the machine by design.
 - **Agents run unsandboxed as you.** Portty intercepts and surfaces permission
   requests; it is not a sandbox. What an approved action then does is the agent's
   business.
