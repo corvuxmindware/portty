@@ -1,0 +1,67 @@
+name: Feature request
+description: Suggest a capability or an improvement.
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Please describe the problem before the solution. Portty controls a real
+        terminal on a real machine, so we weigh new surface area carefully.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem are you trying to solve?
+      description: What are you doing today, and where does it break down?
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: What would you like Portty to do?
+      description: Describe the behaviour you want. A rough sketch is fine.
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: What have you tried or considered?
+      description: Workarounds, other tools, or other designs you rejected.
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Which part of Portty would this touch?
+      options:
+        - portty (CLI)
+        - portty-host (daemon)
+        - Mobile app
+        - Pairing and device management
+        - Coding agent (ACP) integration
+        - File transfer
+        - Push notifications
+        - Packaging or install
+        - Not sure
+    validations:
+      required: true
+
+  - type: textarea
+    id: security
+    attributes:
+      label: Does this change what a paired phone can reach?
+      description: |
+        Be honest here, including "I do not know". Anything that widens what the
+        phone can do, or what runs on the host, needs a threat discussion before
+        any code is written.
+
+  - type: checkboxes
+    id: confirmations
+    attributes:
+      label: Before submitting
+      options:
+        - label: I searched existing issues and did not find this request.
+          required: true
+        - label: This is a feature request, not a security report.
+          required: true

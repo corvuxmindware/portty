@@ -1,0 +1,5 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Report a security vulnerability
+    url: https://github.com/corvuxmindware/portty/security/advisories/new
+    about: Never report a security problem in a public issue. Use private reporting instead.
