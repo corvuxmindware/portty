@@ -1,0 +1,104 @@
+name: Bug report
+description: Something in Portty does not work as documented.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        **Security problem? Do not use this form.**
+        Report it privately: https://github.com/corvuxmindware/portty/security/advisories/new
+
+        **Never paste a pairing ticket, pairing phrase, QR code, identity key, or
+        reconnect token here.** Each one is a complete key to the machine that
+        produced it. Redact before you post.
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: What did you expect, and what did you get instead?
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to reproduce
+      description: The smallest sequence that shows the problem.
+      placeholder: |
+        1. Start `portty-host`
+        2. Run `portty share`
+        3. On the phone, open the session
+        4. ...
+    validations:
+      required: true
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Which part of Portty?
+      options:
+        - portty (CLI)
+        - portty-host (daemon)
+        - Mobile app - Android
+        - Mobile app - iOS
+        - Pairing / unpairing / revoke
+        - Coding agent (ACP) integration
+        - File transfer
+        - Push relay
+        - Packaging or install
+        - Not sure
+    validations:
+      required: true
+
+  - type: input
+    id: host-os
+    attributes:
+      label: Host operating system
+      placeholder: "Windows 11 24H2 / Ubuntu 24.04 / macOS 15.2"
+    validations:
+      required: true
+
+  - type: input
+    id: phone-os
+    attributes:
+      label: Phone operating system
+      description: Leave blank if the problem does not involve the phone.
+      placeholder: "Android 14 (Samsung Galaxy M13) / iOS 18.3"
+
+  - type: input
+    id: version
+    attributes:
+      label: Portty version
+      description: Output of `portty --help` header, or the commit you built from.
+      placeholder: "0.1.2, or commit abc1234"
+    validations:
+      required: true
+
+  - type: input
+    id: agent
+    attributes:
+      label: Which coding agent?
+      description: Only if the problem involves `portty agent`.
+      placeholder: "Claude Code / Codex / OpenCode / Goose"
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant output
+      description: |
+        Terminal output or logs. This is automatically formatted as code, no
+        backticks needed. Redact secrets first.
+      render: shell
+
+  - type: checkboxes
+    id: confirmations
+    attributes:
+      label: Before submitting
+      options:
+        - label: This is not a security vulnerability.
+          required: true
+        - label: I searched existing issues and did not find this one.
+          required: true
+        - label: I removed all pairing material, keys, and tokens from this report.
+          required: true
