@@ -18,6 +18,9 @@ Use GitHub's private vulnerability reporting:
 
 The report stays private between you and the maintainers until a fix is ready.
 
+If you cannot use GitHub's form, email **support@meetcorvux.com** instead and
+mark the subject as a security report.
+
 ### What to include
 
 - What an attacker gains, in one sentence.
