@@ -662,6 +662,29 @@ impl ServerHandshake {
         &self.display_name
     }
 
+    /// Refuse a peer whose FRAMES carry a protocol version this build cannot
+    /// read, and return the one reply it gets.
+    ///
+    /// The frame layer rejects such a frame before the FSM ever sees it, so the
+    /// Hello check in [`Self::step`] cannot answer it. Without a reply the peer
+    /// only saw the connection drop, and the phone could say nothing better than
+    /// "connection lost". The caller sends this reply framed with OUR
+    /// `PROTOCOL_VERSION`: the peer's frame layer then refuses it in turn and
+    /// reports `UnsupportedProtocolVersion { found: <our version> }`, which tells
+    /// it which side is older. A peer that does read our version decodes the
+    /// payload instead and gets the same `UnsupportedVersion` the Hello check
+    /// sends.
+    ///
+    /// Moves the FSM to `Failed`, so nothing more can be stepped on this
+    /// connection. The reply carries no secret and costs nothing to build, and
+    /// the peer had to finish a QUIC handshake and send a whole frame to get it.
+    pub fn reject_unreadable_version(&mut self) -> HandshakeMessage {
+        self.state = ServerState::Failed;
+        HandshakeMessage::PairingFailed {
+            reason: PairingFailure::UnsupportedVersion,
+        }
+    }
+
     pub fn step(&mut self, incoming: HandshakeMessage) -> SyncResult<Outcome> {
         match (&self.state, incoming) {
             (
@@ -1132,6 +1155,31 @@ mod tests {
             }
             other => panic!("an older peer must be refused, got {other:?}"),
         }
+    }
+
+    /// A peer whose frames the frame layer refused gets exactly the reply the
+    /// Hello check would have sent, and the handshake is over: a later, perfectly
+    /// valid Hello on the same connection must not be answered with a challenge.
+    ///
+    /// The payload bytes are pinned because a peer that CAN read our frame
+    /// version decodes them, and both enums are append-only: `PairingFailed` is
+    /// variant 4 and `UnsupportedVersion` is reason 2, in every released build.
+    #[test]
+    fn an_unreadable_version_gets_one_reply_and_ends_the_handshake() {
+        let mut server =
+            ServerHandshake::new(dev(2), "b".into()).with_unwindowed_pairing_secrets([secret()]);
+        let reply = server.reject_unreadable_version();
+        match &reply {
+            HandshakeMessage::PairingFailed { reason } => {
+                assert_eq!(*reason, PairingFailure::UnsupportedVersion);
+            }
+            other => panic!("expected PairingFailed, got {:?}", variant_name(other)),
+        }
+        assert_eq!(postcard::to_allocvec(&reply).unwrap(), vec![4, 2]);
+
+        let mut client = ClientHandshake::first_pair(dev(1), "phone".into(), secret());
+        let err = server.step(client.start()).unwrap_err();
+        assert!(err.to_string().contains("Failed"), "{err}");
     }
 
     #[test]

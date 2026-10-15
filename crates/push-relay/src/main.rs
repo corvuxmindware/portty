@@ -539,6 +539,10 @@ enum NotificationKind {
     Revoked,
 }
 
+// async-trait marks every generated method `#[must_use]`, and from Rust 1.99
+// clippy treats the boxed future it returns as must-use already. The doubled
+// attribute is the macro's, not ours.
+#[allow(clippy::double_must_use)]
 #[async_trait::async_trait]
 trait PushSender: Send + Sync {
     async fn send(&self, device: Device, kind: NotificationKind) -> Result<(), String>;

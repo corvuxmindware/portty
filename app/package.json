@@ -8,7 +8,7 @@
     "design": "vite --open /design-preview.html",
     "build": "vite build",
     "preview": "vite preview",
-    "tauri": "tauri",
+    "tauri": "node scripts/tauri.mjs",
     "test": "vitest run"
   },
   "dependencies": {

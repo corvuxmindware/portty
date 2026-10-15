@@ -1,6 +1,7 @@
 import { createSignal, onCleanup, onMount, Show } from "solid-js";
 import jsQR from "jsqr";
 import { Icon } from "./Icon";
+import { cameraErrorMessage, NO_CAMERA_MESSAGE } from "./lib/friendlyError";
 
 /**
  * Camera-based QR scanner for the pairing flow. Lifted from Corvux's
@@ -22,8 +23,13 @@ import { Icon } from "./Icon";
  * grant (declared in AndroidManifest.xml). `playsinline` keeps the preview from
  * going fullscreen.
  *
- * The PIN is intentionally NOT in the QR - it stays manual as the out-of-band
- * MitM check. Scanning only fills the ticket (here, the bare NodeId).
+ * Scanning only fills the setup-code field; the person still checks the
+ * comparison code and confirms it on the computer.
+ *
+ * ## When the camera won't start
+ * `onError` gets plain words for the reason (denied, missing, busy - see
+ * `cameraErrorMessage`), each offering to paste the code from `portty pair`
+ * instead, never the browser's own "Permission denied".
  */
 
 type FocusCapabilities = MediaTrackCapabilities & { focusMode?: string[]; torch?: boolean };
@@ -172,15 +178,14 @@ export function QrScanner(props: {
 
   onMount(async () => {
     if (!navigator.mediaDevices?.getUserMedia) {
-      props.onError("Camera isn't available on this device - paste the code instead.");
+      props.onError(NO_CAMERA_MESSAGE);
       return;
     }
     try {
       await openCamera();
     } catch (e) {
-      const msg = e instanceof Error ? e.message : String(e);
       console.warn("qr-scanner: getUserMedia rejected", e);
-      props.onError(`Camera access failed: ${msg}`);
+      props.onError(cameraErrorMessage(e));
       return;
     }
     try {

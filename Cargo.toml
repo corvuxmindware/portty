@@ -4,7 +4,7 @@ members = ["crates/transport", "crates/protocol", "crates/host", "crates/cli", "
 exclude = ["app"]  # the Tauri phone app is its own Cargo workspace (app/src-tauri)
 
 [workspace.package]
-version = "0.1.2"
+version = "0.1.3"
 edition = "2021"
 license = "Apache-2.0"
 authors = ["Corvux Mindware"]

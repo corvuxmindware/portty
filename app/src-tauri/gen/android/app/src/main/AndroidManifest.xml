@@ -32,8 +32,14 @@
         android:allowBackup="false"
         android:dataExtractionRules="@xml/data_extraction_rules"
         android:usesCleartextTraffic="${usesCleartextTraffic}">
+        <!-- configChanges: each change listed here is handled in place. Any other
+             change re-creates MainActivity, and Tauri cannot move its runtime to
+             a new Activity, so MainActivity then restarts the app. Keep every
+             change the WebView-only UI can absorb listed (font size, display
+             size, bold text, RTL, ...). fontScale is applied to the WebView in
+             MainActivity.onConfigurationChanged. -->
         <activity
-            android:configChanges="orientation|keyboardHidden|keyboard|screenSize|locale|smallestScreenSize|screenLayout|uiMode"
+            android:configChanges="orientation|keyboardHidden|keyboard|screenSize|locale|smallestScreenSize|screenLayout|uiMode|fontScale|density|fontWeightAdjustment|layoutDirection|colorMode|mcc|mnc|navigation|touchscreen|grammaticalGender"
             android:launchMode="singleTask"
             android:label="@string/main_activity_title"
             android:name=".MainActivity"

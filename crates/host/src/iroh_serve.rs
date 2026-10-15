@@ -17,9 +17,10 @@ use iroh::RelayMode;
 use portty_protocol::{CommandOutcome, Frame, PermissionResolver, RequestKind, SessionId};
 use portty_transport::{
     build_endpoint, confirm_server_handshake, encode_compact_ticket, encode_ticket, open_msg,
-    run_server_handshake, seal_msg, DeviceId, EnvelopeCipher, HandshakeCommit, Identity,
-    IrohTransport, IrohWriter, KeyedPairingRateLimiter, PairingSecret, PairingState, PeerStore,
-    SealedEnvelope, ServerHandshake, SharedPairingState, SharedRateLimiter, ENROLLMENT_WINDOW,
+    run_server_handshake, seal_msg, DeviceId, EnvelopeCipher, HandshakeCommit, HandshakeMessage,
+    Identity, IrohTransport, IrohWriter, KeyedPairingRateLimiter, PairingFailure, PairingSecret,
+    PairingState, PeerStore, ProtocolError, SealedEnvelope, ServerHandshake, SharedPairingState,
+    SharedRateLimiter, SyncError, Transport, TransportError, ENROLLMENT_WINDOW,
 };
 use tokio::sync::{mpsc, Mutex as AsyncMutex};
 use tokio::task::JoinHandle;
@@ -117,6 +118,46 @@ const MAX_STAGING_PER_SOURCE: usize = 2;
 /// Ten seconds is generous for a QUIC handshake plus the first stream; the old
 /// thirty meant one stalled dial squatted a slot for half a minute.
 const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// How long a refused peer gets to read the refusal and hang up before the host
+/// closes the connection itself (see [`IrohTransport::finish_and_close`]).
+///
+/// Dropping the connection straight after a refusal let the close overtake the
+/// refusal, so the phone reported "connection lost" instead of the reason - for a
+/// peer on another protocol version it never got a reason at all. A phone reads
+/// the reply and hangs up within one round trip, so this only bounds a peer that
+/// never does. It is spent inside the slot the connection already holds, and is
+/// shorter than [`HANDSHAKE_TIMEOUT`], which a silent dialer can already take.
+const REFUSAL_LINGER: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// Whether a failed handshake ended by SENDING the peer a refusal: every
+/// `PairingFailed`, and the one reply a peer on another protocol version gets.
+/// Any other failure (I/O, a malformed or out-of-order message) sent nothing, so
+/// there is nothing to deliver and the connection can simply drop.
+fn handshake_sent_refusal(error: &SyncError) -> bool {
+    matches!(
+        error,
+        SyncError::Protocol(ProtocolError::PairingFailed(_))
+            | SyncError::Transport(TransportError::UnsupportedProtocolVersion { .. })
+    )
+}
+
+/// Refuse a pairing AFTER its proof verified, and make sure the reason arrives.
+///
+/// The phone is waiting for `PairingOk` at this point and accepts `PairingFailed`
+/// instead, so it can say why ("declined at the computer", "pairing is no longer
+/// open") rather than "connection lost". The peer already proved the pairing
+/// secret, and the reason is one it could infer anyway, so this reveals nothing.
+///
+/// Best effort, and bounded: the send gets [`REFUSAL_LINGER`] too, so a peer that
+/// withholds flow-control credit cannot park this task while it holds a serving
+/// slot. If the send fails or stalls, dropping is all that is left.
+async fn refuse_after_proof(mut tport: IrohTransport, reason: PairingFailure) {
+    let refusal = HandshakeMessage::PairingFailed { reason };
+    if let Ok(Ok(())) = tokio::time::timeout(REFUSAL_LINGER, tport.send(&refusal)).await {
+        tport.finish_and_close(REFUSAL_LINGER).await;
+    }
+}
 
 /// How many staged handshakes each source currently holds.
 ///
@@ -867,6 +908,11 @@ pub async fn accept_loop(
                 Ok(Ok(o)) => o,
                 Ok(Err(e)) => {
                     error!("handshake failed: {e}");
+                    // A refusal the peer never reads is no better than silence:
+                    // close gracefully so it arrives (bounded by REFUSAL_LINGER).
+                    if handshake_sent_refusal(&e) {
+                        tport.finish_and_close(REFUSAL_LINGER).await;
+                    }
                     return;
                 }
                 Err(_) => {
@@ -960,6 +1006,10 @@ pub async fn accept_loop(
                     peer = %outcome.peer_device_id,
                     "refusing first pair: not confirmed at the host"
                 );
+                // Declined, timed out, no `portty pair` to ask, or another
+                // confirmation already waiting: to the phone all of these are
+                // "the computer did not confirm".
+                refuse_after_proof(tport, PairingFailure::Cancelled).await;
                 return;
             }
             // Claim the one-time enrollment opportunity, if this was a first pair.
@@ -978,6 +1028,7 @@ pub async fn accept_loop(
                         "refusing first pair: the enrollment window was already used \
                          or reopened while this handshake ran"
                     );
+                    refuse_after_proof(tport, PairingFailure::PairingClosed).await;
                     return;
                 }
             }
@@ -2520,6 +2571,44 @@ mod tests {
     use portty_protocol::{CommandOutcome, RequestKind};
     use portty_transport::{run_client_handshake, ClientHandshake, Transport};
     use std::time::Duration;
+
+    /// Only a handshake that SENT a refusal waits for it to be delivered. Every
+    /// `PairingFailed` reason counts, and so does the reply to a peer on another
+    /// protocol version; an I/O error or an out-of-order message sent nothing,
+    /// so it must drop at once rather than hold its slot for the linger.
+    #[test]
+    fn only_a_sent_refusal_waits_to_be_delivered() {
+        for reason in [
+            PairingFailure::WrongPin,
+            PairingFailure::RateLimited,
+            PairingFailure::UnsupportedVersion,
+            PairingFailure::Cancelled,
+            PairingFailure::PairingClosed,
+            PairingFailure::Revoked,
+        ] {
+            assert!(handshake_sent_refusal(&SyncError::Protocol(
+                ProtocolError::PairingFailed(reason)
+            )));
+        }
+        assert!(handshake_sent_refusal(&SyncError::Transport(
+            TransportError::UnsupportedProtocolVersion {
+                expected: 11,
+                found: 12
+            }
+        )));
+        assert!(!handshake_sent_refusal(&SyncError::Transport(
+            TransportError::Closed
+        )));
+        assert!(!handshake_sent_refusal(&SyncError::Transport(
+            TransportError::Io(std::io::Error::other("connection lost"))
+        )));
+        assert!(!handshake_sent_refusal(&SyncError::Protocol(
+            ProtocolError::UnexpectedMessage {
+                state: "AwaitingHello",
+                actual: "PairingProof",
+            }
+        )));
+    }
 
     /// Startup must arm NOTHING. This is the whole fix for "every daemon restart
     /// writes fresh shell-access credentials to service logs": if no secret is

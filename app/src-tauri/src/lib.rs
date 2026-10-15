@@ -10,13 +10,19 @@
 //! Reading in its own task means the session loop's `select!` only ever
 //! cancels mpsc recvs (cancel-safe), never a mid-frame transport read.
 
-#[cfg(target_os = "android")]
+#[cfg(any(target_os = "android", test))]
 mod android_context;
+#[cfg(target_os = "android")]
+mod android_documents;
+mod connect_error;
+mod download_probe;
+mod local_files;
 #[cfg(any(target_os = "android", target_os = "ios"))]
 mod mobile_credentials;
 mod push_wake;
 
 use blake3::Hasher;
+use connect_error::{Attempt, ConnectError};
 use portty_protocol::{
     AgentAuthMethod, AgentCommand, AgentConfigOption, AgentConfigValue, AgentEvent, AgentMode,
     AgentPlanEntry, AgentProvider, AgentTimelineEvent, AgentToolKind, AgentToolStatus,
@@ -25,11 +31,9 @@ use portty_protocol::{
     TerminalRoot, ToolCallCard, TransferId, WorkspaceScope, FILE_CHUNK_BYTES,
 };
 use portty_transport::{
-    build_endpoint, decode_ticket, decode_ticket_secret, open_msg, run_client_handshake,
-    run_client_handshake_with, seal_msg, ClientHandshake, DeviceId, EnvelopeCipher,
-    HandshakeCommit, Identity, IrohReader, IrohTransport, IrohWriter, PairingFailure,
-    PairingSecret, PeerStore, ProtocolError, SealedEnvelope, SyncError, TransportError,
-    PROTOCOL_VERSION,
+    build_endpoint, decode_ticket, decode_ticket_secret, open_msg, seal_msg, ClientHandshake,
+    DeviceId, EnvelopeCipher, HandshakeCommit, Identity, IrohReader, IrohTransport, IrohWriter,
+    PairingSecret, PeerStore, SealedEnvelope,
 };
 use serde::Serialize;
 use std::collections::HashMap;
@@ -186,6 +190,7 @@ struct ClientTransfers {
     slots: Arc<Semaphore>,
     downloads: AsyncMutex<HashMap<TransferId, DownloadTransfer>>,
     uploads: AsyncMutex<HashMap<TransferId, UploadTransfer>>,
+    probes: download_probe::Probes,
 }
 
 /// Which pairing a transfer belongs to. `TransferId`s are process-local and
@@ -250,7 +255,7 @@ struct DownloadTransfer {
     /// `MAX_DOWNLOAD_RESTARTS`).
     restarts: u32,
     remote_path: String,
-    target: std::path::PathBuf,
+    target: local_files::DownloadTarget,
     temporary: std::path::PathBuf,
     file: tokio::fs::File,
     next_seq: u64,
@@ -927,34 +932,15 @@ fn validate_reconnect_ticket_host(
     Ok(saved_host)
 }
 
-/// Pair with a host: decode the ticket, build an endpoint, connect, run the PIN
-/// handshake, then start the reader + session loop. `on_output` is a binary
-/// The one pairing failure whose fix isn't "re-pair": a protocol-version
-/// mismatch. Peers do NOT negotiate (append-only wire, see frame.rs), so the
-/// only remedy is updating the older side. Surface that plainly instead of the
-/// Debug-formatted `PairingFailed(UnsupportedVersion)` blob.
+/// Pair with a host: decode the ticket, build an endpoint, connect, run the
+/// handshake (the person at the computer confirms the comparison code), then
+/// start the reader + session loop. `on_output` is a binary Tauri Channel the
+/// loop pushes ordered `[kind][8-byte LE id][PTY bytes]` messages onto -
+/// avoiding JSON byte arrays while keeping reset + snapshot on one ordered path
+/// (`kind=0` output, `kind=1` reset).
 ///
-/// When the frame layer rejects an incompatible peer it hands us the peer's
-/// wire version (`found`); compare it to ours to name the older side. `None`
-/// falls back to the generic message (the handshake `PairingFailure` variant
-/// carries no version number).
-fn version_mismatch_message(peer_version: Option<u16>) -> String {
-    match peer_version {
-        Some(peer) if peer < PROTOCOL_VERSION => "The laptop is running an older Portty version \
-             than this phone. Update Portty on the laptop, then reconnect."
-            .to_string(),
-        Some(peer) if peer > PROTOCOL_VERSION => "This phone is running an older Portty version \
-             than the laptop. Update Portty from the App Store, then reconnect."
-            .to_string(),
-        _ => "This phone and the laptop are running different Portty versions. Update \
-             whichever is older, then reconnect."
-            .to_string(),
-    }
-}
-
-/// Tauri Channel the loop pushes ordered `[kind][8-byte LE id][PTY bytes]`
-/// messages onto - avoiding JSON byte arrays while keeping reset + snapshot on
-/// one ordered path (`kind=0` output, `kind=1` reset).
+/// Fails with a [`ConnectError`]: plain words for the screen, the technical
+/// text kept beside them (see `connect_error`).
 #[tauri::command]
 async fn pair(
     state: State<'_, PorttyState>,
@@ -962,12 +948,12 @@ async fn pair(
     ticket: String,
     secret_phrase: Option<String>,
     on_output: tauri::ipc::Channel<Vec<u8>>,
-) -> Result<(), String> {
+) -> Result<(), ConnectError> {
     // Single in-flight connection op (see PorttyState::connecting).
     let _conn = state
         .connecting
         .try_lock()
-        .map_err(|_| "a connection attempt is already in progress".to_string())?;
+        .map_err(|_| connect_error::busy())?;
     // Self-heal: a lingering (possibly dead) link must not block a deliberate
     // pair. Take it down exactly like `disconnect` - dropping the `Connection`
     // fires its shutdown kill switch, which stops the session loop and closes
@@ -977,9 +963,11 @@ async fn pair(
     if let Some(old) = state.connection.lock().await.take() {
         old.pending.lock().await.clear();
     }
-    let peer = decode_ticket(ticket.trim()).map_err(|e| e.to_string())?;
-    let expected_host = portty_transport::device_id_from_node_id(peer.id)
-        .map_err(|e| format!("invalid host identity in pairing ticket: {e}"))?;
+    let peer =
+        decode_ticket(ticket.trim()).map_err(|e| connect_error::invalid_code(e.to_string()))?;
+    let expected_host = portty_transport::device_id_from_node_id(peer.id).map_err(|e| {
+        connect_error::invalid_code(format!("invalid host identity in pairing ticket: {e}"))
+    })?;
     let observed_revocation = state.peers.lock().await.revocation_marker(&expected_host);
     // The out-of-band secret IS the first-pair credential - there is no PIN
     // beside it any more, so without one there is nothing to pair with and we
@@ -992,18 +980,15 @@ async fn pair(
                 .filter(|p| !p.trim().is_empty())
                 .and_then(PairingSecret::from_phrase)
         })
-        .ok_or(
-            "this pairing code carries no secret. Scan the QR, paste the full \
-             portty1:… ticket, or type the six-word phrase shown on your computer",
-        )?;
+        .ok_or_else(|| connect_error::invalid_code("this pairing code carries no secret"))?;
     let endpoint = build_endpoint(&state.identity, iroh::RelayMode::Default)
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| connect_error::network(&e))?;
     let mut tport = match IrohTransport::connect(&endpoint, peer).await {
         Ok(tport) => tport,
         Err(e) => {
             endpoint.close().await;
-            return Err(e.to_string());
+            return Err(connect_error::unreachable(&e).logged(Attempt::FirstPair));
         }
     };
     let mut hs =
@@ -1014,7 +999,7 @@ async fn pair(
     // on a blank spinner while its own screen holds the thing the user is being
     // asked to check.
     let code_app = app.clone();
-    let outcome = match run_client_handshake_with(&mut tport, &mut hs, move |code| {
+    let outcome = match connect_error::run_counted_handshake(&mut tport, &mut hs, move |code| {
         if let Err(e) = code_app.emit(PAIR_CODE_EVENT, code.to_string()) {
             tracing::warn!(error = %e, "could not show the pairing code on screen");
         }
@@ -1022,21 +1007,14 @@ async fn pair(
     .await
     {
         Ok(outcome) => outcome,
-        // Frame-layer rejection of an incompatible peer: we know the peer's wire
-        // version, so name the older side.
-        Err(SyncError::Transport(TransportError::UnsupportedProtocolVersion { found, .. })) => {
+        // Typed: a frame from another wire version names the older side, a
+        // refusal says which one, and a link that closed before the computer
+        // answered at all points at an older computer program (S1).
+        Err(failure) => {
             endpoint.close().await;
-            return Err(version_mismatch_message(Some(found)));
-        }
-        Err(SyncError::Protocol(ProtocolError::PairingFailed(
-            PairingFailure::UnsupportedVersion,
-        ))) => {
-            endpoint.close().await;
-            return Err(version_mismatch_message(None));
-        }
-        Err(e) => {
-            endpoint.close().await;
-            return Err(e.to_string());
+            return Err(failure
+                .describe(Attempt::FirstPair)
+                .logged(Attempt::FirstPair));
         }
     };
     let validated_host = match validate_handshake_host(expected_host, outcome.peer_device_id) {
@@ -1044,7 +1022,7 @@ async fn pair(
         Err(error) => {
             tracing::warn!("rejecting host: handshake identity does not match pairing ticket");
             endpoint.close().await;
-            return Err(error);
+            return Err(connect_error::wrong_host(Attempt::FirstPair, error));
         }
     };
     tracing::info!("pair: handshake done, starting session loop");
@@ -1072,9 +1050,11 @@ async fn pair(
             Err(e) => {
                 drop(peers);
                 endpoint.close().await;
-                return Err(format!(
-                    "paired, but could not save reconnect credentials: {e}"
-                ));
+                return Err(connect_error::save_failed(
+                    Attempt::FirstPair,
+                    format!("paired, but could not save reconnect credentials: {e}"),
+                )
+                .logged(Attempt::FirstPair));
             }
         };
         // Remember this as the host to redial by default (deterministic last_host).
@@ -1269,9 +1249,10 @@ async fn start_session(
     ));
 }
 
-/// Reconnect to the last-paired host by the stored resumption token - no PIN, no
-/// pasted ticket. Fails (→ caller shows the pair screen) if no host is saved or
-/// the token was rejected (host re-paired / rotated): then re-pair by PIN.
+/// Reconnect to the last-paired host by the stored resumption token - no code,
+/// no pasted ticket. Fails with a [`ConnectError`] that says what to do: only a
+/// refused saved pairing (forgotten, rotated away, removed) asks to pair again;
+/// an unreachable or out-of-date computer says so instead.
 #[tauri::command]
 async fn reconnect(
     state: State<'_, PorttyState>,
@@ -1280,12 +1261,12 @@ async fn reconnect(
     // Host picker: resume a SPECIFIC saved laptop by its device-id hex.
     // `None` keeps the classic behavior (most recent host).
     host: Option<String>,
-) -> Result<(), String> {
+) -> Result<(), ConnectError> {
     // Single in-flight connection op (see PorttyState::connecting).
     let _conn = state
         .connecting
         .try_lock()
-        .map_err(|_| "a connection attempt is already in progress".to_string())?;
+        .map_err(|_| connect_error::busy())?;
     // Self-heal a lingering dead link (see `pair` for the full rationale).
     if let Some(old) = state.connection.lock().await.take() {
         old.pending.lock().await.clear();
@@ -1295,32 +1276,33 @@ async fn reconnect(
         let selected = match host.as_deref() {
             // Host picker: a specific saved laptop.
             Some(hex) => {
-                let dev = DeviceId::from_hex(hex).ok_or("bad host id")?;
+                let dev = DeviceId::from_hex(hex).ok_or_else(connect_error::host_not_saved)?;
                 peers
                     .known_hosts()
                     .into_iter()
                     .find(|(d, _, _)| *d == dev)
-                    .ok_or_else(|| "that host is no longer saved - pair it again".to_string())?
+                    .ok_or_else(connect_error::host_not_saved)?
             }
-            None => peers
-                .last_host()
-                .ok_or_else(|| "no saved host - pair first".to_string())?,
+            None => peers.last_host().ok_or_else(connect_error::no_saved_host)?,
         };
         let marker = peers.revocation_marker(&selected.0);
         (selected.0, selected.1, selected.2, marker)
     };
-    let peer = decode_ticket(&ticket).map_err(|e| e.to_string())?;
-    let ticket_host = portty_transport::device_id_from_node_id(peer.id)
-        .map_err(|e| format!("invalid host identity in saved reconnect ticket: {e}"))?;
-    validate_reconnect_ticket_host(host_dev, ticket_host)?;
+    let peer = decode_ticket(&ticket).map_err(|e| connect_error::saved_damaged(e.to_string()))?;
+    let ticket_host = portty_transport::device_id_from_node_id(peer.id).map_err(|e| {
+        connect_error::saved_damaged(format!(
+            "invalid host identity in saved reconnect ticket: {e}"
+        ))
+    })?;
+    validate_reconnect_ticket_host(host_dev, ticket_host).map_err(connect_error::saved_damaged)?;
     let endpoint = build_endpoint(&state.identity, iroh::RelayMode::Default)
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| connect_error::network(&e))?;
     let mut tport = match IrohTransport::connect(&endpoint, peer).await {
         Ok(tport) => tport,
         Err(e) => {
             endpoint.close().await;
-            return Err(e.to_string());
+            return Err(connect_error::unreachable(&e).logged(Attempt::Reconnect));
         }
     };
     // SEC-2: resume by the stored token. The PIN is unused on a resume, so a
@@ -1333,37 +1315,32 @@ async fn reconnect(
     let observed_token = Some(token.clone());
     let mut hs = ClientHandshake::resume(state.identity.device_id(), "phone".into(), token);
     tracing::info!("reconnect: resuming by stored token");
-    let outcome = match run_client_handshake(&mut tport, &mut hs).await {
+    let outcome = match connect_error::run_counted_handshake(&mut tport, &mut hs, |_| {}).await {
         Ok(outcome) => outcome,
-        Err(SyncError::Protocol(ProtocolError::PairingFailed(PairingFailure::Revoked))) => {
+        Err(failure) if failure.is_revoked() => {
             endpoint.close().await;
-            state
-                .peers
-                .lock()
-                .await
-                .forget(&host_dev)
-                .map_err(|e| format!("host revoked this pair; local cleanup failed: {e}"))?;
+            state.peers.lock().await.forget(&host_dev).map_err(|e| {
+                connect_error::revoked_cleanup_failed(format!(
+                    "host revoked this pair; local cleanup failed: {e}"
+                ))
+            })?;
             let _ = app.emit(
                 "portty://pair-revoked",
                 PairRevokedPayload {
                     host: host_dev.as_hex(),
                 },
             );
-            return Err("pair revoked by laptop".into());
+            return Err(connect_error::revoked(Attempt::Reconnect));
         }
-        Err(SyncError::Transport(TransportError::UnsupportedProtocolVersion { found, .. })) => {
+        // Typed, as in `pair`: version mismatch names the older side, a refused
+        // saved pairing asks to pair again, and a link that closed before the
+        // computer answered points at an older computer program - never at
+        // re-pairing, which cannot fix that.
+        Err(failure) => {
             endpoint.close().await;
-            return Err(version_mismatch_message(Some(found)));
-        }
-        Err(SyncError::Protocol(ProtocolError::PairingFailed(
-            PairingFailure::UnsupportedVersion,
-        ))) => {
-            endpoint.close().await;
-            return Err(version_mismatch_message(None));
-        }
-        Err(e) => {
-            endpoint.close().await;
-            return Err(format!("reconnect failed - re-pair: {e}"));
+            return Err(failure
+                .describe(Attempt::Reconnect)
+                .logged(Attempt::Reconnect));
         }
     };
     let validated_host = match validate_handshake_host(host_dev, outcome.peer_device_id) {
@@ -1371,7 +1348,7 @@ async fn reconnect(
         Err(error) => {
             tracing::warn!("rejecting host: handshake identity does not match saved host");
             endpoint.close().await;
-            return Err(error);
+            return Err(connect_error::wrong_host(Attempt::Reconnect, error));
         }
     };
     // Rotate the token for next time; keep the same ticket to redial.
@@ -1393,9 +1370,11 @@ async fn reconnect(
             Err(e) => {
                 drop(peers);
                 endpoint.close().await;
-                return Err(format!(
-                    "reconnected, but could not save rotated token: {e}"
-                ));
+                return Err(connect_error::save_failed(
+                    Attempt::Reconnect,
+                    format!("reconnected, but could not save rotated token: {e}"),
+                )
+                .logged(Attempt::Reconnect));
             }
         };
         if let Err(e) = peers.set_last_host(validated_host) {
@@ -1769,6 +1748,11 @@ async fn session_loop(
                         );
                     }
                     Frame::FileChunk { id, seq, bytes } => {
+                        if download_probe::is_probe(id) {
+                            let link = Some(&control_tx);
+                            download_probe::answer(&transfers.probes, id, owner, Ok(()), link).await;
+                            continue;
+                        }
                         let mut downloads = transfers.downloads.lock().await;
                         // Summed BEFORE taking the mutable borrow below. Includes
                         // this transfer's own bytes, which is what we want: the
@@ -1879,11 +1863,15 @@ async fn session_loop(
                                 direction: "download",
                                 transferred: transfer.written,
                                 total: None,
-                                path: transfer.target.to_string_lossy().into_owned(),
+                                path: transfer.target.label(),
                             },
                         );
                     }
                     Frame::FileDone { id, size, checksum } => {
+                        if download_probe::is_probe(id) {
+                            download_probe::answer(&transfers.probes, id, owner, Ok(()), None).await;
+                            continue;
+                        }
                         let transfer = take_owned_download(&transfers, id, owner).await;
                         let Some(mut transfer) = transfer else {
                             if let Some(upload) = take_owned_upload(&transfers, id, owner).await {
@@ -1972,14 +1960,31 @@ async fn session_loop(
                             continue;
                         }
                         drop(transfer.file);
-                        match replace_download_file(&transfer.temporary, &transfer.target).await {
+                        let target = match transfer.target {
+                            local_files::DownloadTarget::Path(target) => target,
+                            // An Android document cannot be renamed onto: the
+                            // verified bytes are copied into it, off this loop.
+                            local_files::DownloadTarget::Document(document) => {
+                                local_files::spawn_document_commit(
+                                    app.clone(),
+                                    id.0,
+                                    transfer.temporary,
+                                    document,
+                                    size,
+                                    checksum,
+                                    transfer._slot,
+                                );
+                                continue;
+                            }
+                        };
+                        match replace_download_file(&transfer.temporary, &target).await {
                             Ok(()) => {
                                 let _ = app.emit(
                                     "portty://transfer-complete",
                                     TransferCompletePayload {
                                         id: id.0,
                                         direction: "download",
-                                        path: transfer.target.to_string_lossy().into_owned(),
+                                        path: target.to_string_lossy().into_owned(),
                                     },
                                 );
                             }
@@ -2015,6 +2020,10 @@ async fn session_loop(
                         }
                     }
                     Frame::FileErr { id, reason } => {
+                        if download_probe::is_probe(id) {
+                            download_probe::answer(&transfers.probes, id, owner, Err(reason), None).await;
+                            continue;
+                        }
                         let mut owned = false;
                         if let Some(transfer) = take_owned_download(&transfers, id, owner).await {
                             owned = true;
@@ -2873,10 +2882,15 @@ async fn permission_decision(
 #[tauri::command]
 async fn download_file(
     state: State<'_, PorttyState>,
+    app: tauri::AppHandle,
     remote_path: String,
     local_path: String,
     allow_outside_home: Option<bool>,
 ) -> Result<u64, String> {
+    // Destination first. On Android it is a document the Save dialog has
+    // already created, empty; if anything below refuses the download, dropping
+    // it removes that file again instead of leaving it to pass for the download.
+    let (target, staging_dir) = local_files::prepare_download_target(&app, &local_path).await?;
     let slot = state
         .transfers
         .slots
@@ -2905,11 +2919,7 @@ async fn download_file(
         )
     };
     let id = TransferId(state.transfers.next_id.fetch_add(1, Ordering::Relaxed));
-    let target = std::path::PathBuf::from(local_path);
-    let parent = target
-        .parent()
-        .ok_or_else(|| "download destination has no parent directory".to_string())?;
-    tokio::fs::create_dir_all(parent)
+    tokio::fs::create_dir_all(&staging_dir)
         .await
         .map_err(|e| format!("cannot create download directory: {e}"))?;
     // Unpredictable name, and CREATE_NEW rather than create+truncate.
@@ -2921,7 +2931,7 @@ async fn download_file(
     // link and have the download written through it, to a path the user never
     // chose. A random name nobody can guess plus O_EXCL closes both: a link
     // sitting at our path is now an error, not a redirect.
-    let temporary = parent.join(format!(
+    let temporary = staging_dir.join(format!(
         ".portty-download-{}-{}.part",
         id.0,
         random_hex_suffix()
@@ -2993,14 +3003,12 @@ async fn upload_file(
                 format!("at most {MAX_ACTIVE_FILE_TRANSFERS} file transfers may run at once")
             })?,
     );
-    let local_path = std::path::PathBuf::from(local_path);
     // Open FIRST, then ask the handle about itself. Statting the path and
     // opening it separately are two different files whenever anything can write
     // the directory in between; the size announced to the host must describe the
     // bytes actually about to be sent.
-    let file = tokio::fs::File::open(&local_path)
-        .await
-        .map_err(|e| format!("cannot open upload: {e}"))?;
+    let source = local_files::open_upload_source(&app, &local_path).await?;
+    let file = source.file;
     let metadata = file
         .metadata()
         .await
@@ -3046,6 +3054,9 @@ async fn upload_file(
     };
     #[cfg(not(unix))]
     let mode = None;
+    // A picked Android document's mode describes its provider's storage, not a
+    // permission anyone chose; the host keeps its owner-only default instead.
+    let mode = if source.is_document { None } else { mode };
     if outbound
         .send(Frame::FilePutReq {
             id,
@@ -3502,10 +3513,20 @@ fn install_rustls_crypto_provider() {
 /// Android). Without this, every `tracing::` event is dropped and the phone is a
 /// black box during pairing. Default filter: our crates at `debug`, everything
 /// else at `info`; override with `RUST_LOG` where that's settable.
+///
+/// Release builds keep only our own warnings and everyone's errors. Logcat is
+/// readable over adb and lands in every bug report, and the connection chatter
+/// below that (peer keys, IP addresses, timings) only earns its place while
+/// debugging - iroh puts IP addresses in some of its warnings, too.
 fn init_tracing() {
     use tracing_subscriber::EnvFilter;
-    let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new("info,portty_transport=debug,portty_app_lib=debug"));
+    let default_filter = if cfg!(debug_assertions) {
+        "info,portty_transport=debug,portty_app_lib=debug"
+    } else {
+        "error,portty_transport=warn,portty_app_lib=warn"
+    };
+    let filter =
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default_filter));
     let _ = tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_target(true)
@@ -3536,6 +3557,41 @@ fn open_external_url(app: tauri::AppHandle, url: String) -> Result<(), String> {
 #[tauri::command]
 fn biometric_platform_enforced() -> bool {
     cfg!(mobile)
+}
+
+/// What the About screen shows that only the Rust core knows. The app version
+/// comes from Tauri's own `getVersion()`; the wire protocol version lives in
+/// the transport crate, and the phone and the computer must speak the same one.
+#[derive(Debug, PartialEq, Eq, serde::Serialize)]
+struct AppInfo {
+    protocol_version: u16,
+}
+
+#[tauri::command]
+fn app_info() -> AppInfo {
+    AppInfo {
+        protocol_version: portty_transport::PROTOCOL_VERSION,
+    }
+}
+
+#[cfg(test)]
+mod app_info_tests {
+    use super::*;
+
+    #[test]
+    fn app_info_reports_the_wire_protocol_version() {
+        assert_eq!(
+            app_info(),
+            AppInfo {
+                protocol_version: portty_transport::PROTOCOL_VERSION
+            }
+        );
+        // The About screen reads this exact field name.
+        assert_eq!(
+            serde_json::to_value(app_info()).unwrap(),
+            serde_json::json!({ "protocol_version": portty_transport::PROTOCOL_VERSION })
+        );
+    }
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -3607,6 +3663,7 @@ pub fn run() {
                     slots: Arc::new(Semaphore::new(MAX_ACTIVE_FILE_TRANSFERS)),
                     downloads: AsyncMutex::new(HashMap::new()),
                     uploads: AsyncMutex::new(HashMap::new()),
+                    probes: Default::default(),
                 }),
                 last_seen_seq: Arc::new(AsyncMutex::new(HashMap::new())),
                 last_seen_generation: Arc::new(AsyncMutex::new(HashMap::new())),
@@ -3615,6 +3672,7 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            app_info,
             decision_log_load,
             decision_log_save,
             decision_log_forget,
@@ -3647,6 +3705,8 @@ pub fn run() {
             permission_decision,
             download_file,
             upload_file,
+            local_files::suggest_upload_name,
+            download_probe::probe_download,
             kill,
             rename,
             disconnect,
@@ -3790,7 +3850,7 @@ mod tests {
             owner,
             restarts: 0,
             remote_path: "/home/user/secret.txt".into(),
-            target: "/phone/secret.txt".into(),
+            target: local_files::DownloadTarget::Path("/phone/secret.txt".into()),
             temporary: "/phone/.secret.part".into(),
             file: tokio::fs::File::from_std(tempfile::tempfile().unwrap()),
             next_seq: 0,
@@ -3807,6 +3867,7 @@ mod tests {
             slots: Arc::new(Semaphore::new(MAX_ACTIVE_FILE_TRANSFERS)),
             downloads: AsyncMutex::new(HashMap::new()),
             uploads: AsyncMutex::new(HashMap::new()),
+            probes: Default::default(),
         })
     }
 

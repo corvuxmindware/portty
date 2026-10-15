@@ -51,6 +51,15 @@ const states: PreviewState[] = [
     sources: ["App.tsx:3134", "styles.css:915"],
   },
   {
+    id: "home-first-run",
+    group: "Home",
+    name: "First run · no saved host",
+    description:
+      "Nothing is paired yet, so Home says where the computer program comes from: the install command for Windows, macOS or Linux with a Copy button, the pairing steps, and a link to the setup guide. Pairing stays the primary action below.",
+    icon: "home",
+    sources: ["App.tsx:3689", "SetupHelp.tsx:77", "SetupHelp.css:11", "lib/setupHelp.ts:26"],
+  },
+  {
     id: "home-agent-picker",
     group: "Home",
     name: "Coding-agent picker",
@@ -137,6 +146,42 @@ const states: PreviewState[] = [
     sources: ["App.tsx:3594", "styles.css:1533"],
   },
   {
+    id: "home-connect-error",
+    group: "Home",
+    name: "Saved host · out-of-date computer",
+    description:
+      "The launch reconnect reached a computer that closed the link before answering - what an older Portty program (0.1.2, wire version 5) does. The Home status line says so in plain words, names the fix and the command to check it, and keeps the technical text behind Details. It never says to pair again: that cannot fix an old program.",
+    icon: "host",
+    sources: ["App.tsx", "ErrorNote.tsx", "lib/friendlyError.ts", "src-tauri/src/connect_error.rs"],
+  },
+  {
+    id: "pair-error",
+    group: "Pairing",
+    name: "Pairing code expired",
+    description:
+      "The computer refused the pairing code because it had already been used or its five minutes ran out. The error box says what happened and what to do next; the line under it still says where the connection stands.",
+    icon: "pair",
+    sources: ["App.tsx", "ErrorNote.tsx", "src-tauri/src/connect_error.rs"],
+  },
+  {
+    id: "pair-camera-denied",
+    group: "Pairing",
+    name: "Camera not allowed",
+    description:
+      "Scan QR with the camera permission denied. The message names the settings screen for this platform and offers \"Paste code instead\", which puts the cursor in the setup-code field.",
+    icon: "pair",
+    sources: ["QrScanner.tsx", "App.tsx", "lib/friendlyError.ts"],
+  },
+  {
+    id: "terminal-transfer-error",
+    group: "Terminal",
+    name: "Download failed",
+    description:
+      "The computer refused a download because the file isn't there. The whole sentence shows (the one-line transfer bar used to cut it off) and the path stays out of it; Details keeps the computer's reason, with the path redacted.",
+    icon: "terminal",
+    sources: ["App.tsx", "ErrorNote.tsx", "lib/friendlyError.ts"],
+  },
+  {
     id: "terminal-fit",
     group: "Terminal",
     name: "Shell · fit to phone",
@@ -200,6 +245,24 @@ const states: PreviewState[] = [
     description: "The terminal stays visibly busy until the first snapshot bytes arrive instead of presenting an unexplained black screen.",
     icon: "terminal",
     sources: ["App.tsx:1160", "App.tsx:2692", "styles.css:1037"],
+  },
+  {
+    id: "terminal-reconnecting",
+    group: "Terminal",
+    name: "Reconnecting · typing held",
+    description:
+      "The link dropped under an open shell - the host went offline, or the link failed its check after a long background. Typing is held and sent once the session is back, instead of vanishing into a dead link, and the banner says so. A check that answers quickly never shows it.",
+    icon: "terminal",
+    sources: ["App.tsx:3148", "App.tsx:553", "lib/linkGuard.ts:1", "styles.css:841"],
+  },
+  {
+    id: "terminal-session-ended",
+    group: "Terminal",
+    name: "Reconnected · session ended",
+    description:
+      "The host restarted while a shell was open, and a command was typed during the outage. After the reconnect the session is gone, so the app returns to the list with one message saying so - never \"session restored\". Without typing it reads \"Reconnected - that session ended on the computer\". The toast lasts four seconds; reload the frame to replay it.",
+    icon: "terminal",
+    sources: ["App.tsx:2607", "App.tsx:3035", "lib/reconnectNotice.ts:1", "styles.css:806"],
   },
   {
     id: "agent-ready",
@@ -306,6 +369,24 @@ const states: PreviewState[] = [
       "Four agents waiting in a row, two of them with more than one request. This is the stress test for the amber treatment: two separated cards always look fine, so the question is whether adjacent 18px glows bleed into one wash where nothing stands out. Judge this state, not the tidy one.",
     icon: "approval",
     sources: ["styles.css:651", "App.tsx:3531"],
+  },
+  {
+    id: "about",
+    group: "Home",
+    name: "About Portty",
+    description:
+      "Opened by the (i) button at the end of the home header. Shows the app version (Tauri's getVersion) and the phone-to-computer protocol version (the app_info command), with one line on why the two sides must match, then rows for the open-source licences and the public source code (opened in the system browser).",
+    icon: "settings",
+    sources: ["About.tsx:16", "about.css:4", "App.tsx:3539"],
+  },
+  {
+    id: "about-licences",
+    group: "Home",
+    name: "Open-source licences",
+    description:
+      "The bundled third-party-notices.txt - fonts and icons, JavaScript packages, Rust crates and Android libraries, then each licence text once. It is fetched only when this screen opens and drawn in blocks of wrapped monospace text, so the ~400 KB file stays readable on a phone and off-screen blocks cost nothing.",
+    icon: "settings",
+    sources: ["About.tsx:109", "about.css:67", "lib/notices.ts:1"],
   },
   {
     id: "agent-notification-banner",

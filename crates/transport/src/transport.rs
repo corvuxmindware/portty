@@ -11,6 +11,10 @@ use crate::error::TransportError;
 
 /// One end of a bidirectional, framed, encrypted message channel carrying
 /// whole messages of type `M`.
+// async-trait marks every generated method `#[must_use]`, and from Rust 1.99
+// clippy treats the boxed future it returns as must-use already. The doubled
+// attribute is the macro's, not ours.
+#[allow(clippy::double_must_use)]
 #[async_trait]
 pub trait Transport<M>: Send + Sync
 where

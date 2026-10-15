@@ -88,7 +88,7 @@ fn push_entitlement_is_production_for_release_and_development_for_debug() {
 /// `cargo test` stops at the first failing test BINARY, so this file never ran.
 /// Bump every constant below together - see packaging/MAC_IOS_BUILD_RUNBOOK.md
 /// section 5.
-const MARKETING_VERSION: &str = "0.1.2";
+const MARKETING_VERSION: &str = "0.1.3";
 const BUILD_NUMBER: &str = "1.27";
 
 #[test]

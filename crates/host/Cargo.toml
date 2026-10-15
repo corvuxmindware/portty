@@ -10,7 +10,7 @@ description = "Portty host daemon - PTY session manager + dumb byte pipe + local
 portty-protocol = { path = "../protocol" }
 portty-transport = { path = "../transport" }
 tokio = { workspace = true }
-portable-pty = "0.9"
+portable-pty = "0.8"
 axum = { version = "0.8", features = ["ws"] }
 iroh = { version = "1", default-features = false, features = ["tls-ring"] }
 serde = { workspace = true }

@@ -68,6 +68,84 @@ fn main_activity_requests_the_android13_notification_prompt() {
     );
 }
 
+/// The `android:configChanges` flags declared on `<activity android:name=name>`.
+fn activity_config_changes(manifest: &str, name: &str) -> Vec<String> {
+    let activity = manifest
+        .split("<activity")
+        .skip(1)
+        .find(|element| element.contains(&format!(r#"android:name="{name}""#)))
+        .unwrap_or_else(|| panic!("AndroidManifest.xml declares no {name} activity"));
+    let value = activity
+        .split(r#"android:configChanges=""#)
+        .nth(1)
+        .and_then(|rest| rest.split('"').next())
+        .unwrap_or_else(|| panic!("{name} declares no android:configChanges"));
+    value
+        .split('|')
+        .map(|flag| flag.trim().to_owned())
+        .collect()
+}
+
+#[test]
+fn main_activity_handles_configuration_changes_in_place() {
+    let manifest = read("gen/android/app/src/main/AndroidManifest.xml");
+    let handled = activity_config_changes(&manifest, ".MainActivity");
+
+    // Any change not listed re-creates MainActivity, which Tauri cannot follow
+    // (MainActivity restarts the whole app instead). Font size, display size,
+    // bold text, and RTL used to abort the process here.
+    for required in [
+        "orientation",
+        "keyboardHidden",
+        "keyboard",
+        "screenSize",
+        "smallestScreenSize",
+        "screenLayout",
+        "locale",
+        "layoutDirection",
+        "uiMode",
+        "fontScale",
+        "fontWeightAdjustment",
+        "density",
+        "colorMode",
+        "mcc",
+        "mnc",
+        "navigation",
+        "touchscreen",
+        "grammaticalGender",
+    ] {
+        assert!(
+            handled.iter().any(|flag| flag == required),
+            "MainActivity configChanges is missing {required}: {handled:?}"
+        );
+    }
+
+    // A live WebView reads the font scale only when it is created, so handling
+    // fontScale in place means passing a changed scale on to it.
+    let activity = read("gen/android/app/src/main/java/org/example/portty/MainActivity.kt");
+    assert!(
+        activity.contains("newConfig.fontScale") && activity.contains("settings.textZoom"),
+        "MainActivity handles fontScale itself, so it must update the WebView text zoom"
+    );
+}
+
+#[test]
+fn a_second_main_activity_restarts_the_app() {
+    let activity = read("gen/android/app/src/main/java/org/example/portty/MainActivity.kt");
+
+    // Tauri's runtime stays bound to the first Activity of a process (stale
+    // plugins, no WebView for a new Activity id), so a re-created MainActivity
+    // must start a fresh process rather than run half-broken.
+    assert!(
+        activity.contains("Intent.makeRestartActivityTask"),
+        "a re-created MainActivity must reopen the app in a fresh task"
+    );
+    assert!(
+        activity.contains("Process.killProcess(Process.myPid())"),
+        "a re-created MainActivity must end the process that owns the stale runtime"
+    );
+}
+
 #[test]
 fn release_build_is_minified_signable_and_never_cleartext() {
     let gradle = read("gen/android/app/build.gradle.kts");
@@ -89,6 +167,46 @@ fn release_build_is_minified_signable_and_never_cleartext() {
 }
 
 #[test]
+fn no_app_data_leaves_the_phone_by_backup_or_transfer() {
+    let rules = read("gen/android/app/src/main/res/xml/data_extraction_rules.xml");
+    let manifest = read("gen/android/app/src/main/AndroidManifest.xml");
+
+    assert!(manifest.contains(r#"android:allowBackup="false""#));
+    assert!(manifest.contains(r#"android:dataExtractionRules="@xml/data_extraction_rules""#));
+
+    // Tauri's data dir is the `root` domain, so leaving that one out used to let
+    // device-to-device transfer copy host names, approval rules and the wake key
+    // to a new phone. allowBackup="false" does not stop that transfer on 12+.
+    for section in ["cloud-backup", "device-transfer"] {
+        let body = rules
+            .split(&format!("<{section}>"))
+            .nth(1)
+            .and_then(|rest| rest.split(&format!("</{section}>")).next())
+            .unwrap_or_else(|| panic!("data_extraction_rules.xml has no <{section}> section"));
+        assert!(
+            !body.contains("<include"),
+            "<{section}> must not include anything back"
+        );
+        for domain in [
+            "root",
+            "file",
+            "database",
+            "sharedpref",
+            "external",
+            "device_root",
+            "device_file",
+            "device_database",
+            "device_sharedpref",
+        ] {
+            assert!(
+                body.contains(&format!(r#"<exclude domain="{domain}" />"#)),
+                "<{section}> must exclude the {domain} domain"
+            );
+        }
+    }
+}
+
+#[test]
 fn tauri_config_pins_the_android_version_code() {
     let config = read("tauri.conf.json");
 
@@ -96,8 +214,27 @@ fn tauri_config_pins_the_android_version_code() {
     // code is what makes each Play upload installable over the previous one.
     // Bump it together with the iOS bundleVersion (and this assertion).
     assert!(
-        config.contains("\"versionCode\": 1007"),
+        config.contains("\"versionCode\": 1027"),
         "tauri.conf.json must pin bundle > android > versionCode"
+    );
+}
+
+#[test]
+fn android_10_is_the_oldest_supported_release() {
+    let config = read("tauri.conf.json");
+    let gradle = read("gen/android/app/build.gradle.kts");
+
+    // Below Android 10 the system WebView is too old for the keyboard insets
+    // the terminal relies on: the keyboard covers the KeyBar and input line.
+    // The Gradle value is the one that ships; the config copy is what a
+    // regenerated Android project would start from, so the two must agree.
+    assert!(
+        gradle.contains("minSdk = 29"),
+        "build.gradle.kts must set minSdk = 29 (Android 10)"
+    );
+    assert!(
+        config.contains("\"minSdkVersion\": 29"),
+        "tauri.conf.json must set bundle > android > minSdkVersion to 29"
     );
 }
 
@@ -160,4 +297,127 @@ fn mobile_components_do_not_use_platform_font_glyphs_as_icons() {
             );
         }
     }
+}
+
+// Release native-library hygiene: a stripped .so, Play debug symbols, a pinned
+// NDK, and no build-machine paths. See packaging/ANDROID_BUILD_RUNBOOK.md,
+// "Native library and NDK".
+
+/// The text inside the braces that open after the first `header` in `source`.
+fn braced_block<'a>(source: &'a str, header: &str) -> &'a str {
+    let start = source
+        .find(header)
+        .unwrap_or_else(|| panic!("no `{header}` block"));
+    let open = start
+        + source[start..]
+            .find('{')
+            .unwrap_or_else(|| panic!("`{header}` opens no block"));
+    let mut depth = 0;
+    for (offset, ch) in source[open..].char_indices() {
+        match ch {
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return &source[open + 1..open + offset];
+                }
+            }
+            _ => {}
+        }
+    }
+    panic!("`{header}` block is never closed");
+}
+
+#[test]
+fn only_debug_builds_keep_native_debug_symbols() {
+    let gradle = read("gen/android/app/build.gradle.kts");
+    let debug_only = braced_block(&gradle, r#"onVariants(selector().withBuildType("debug"))"#);
+
+    assert!(
+        debug_only.contains("keepDebugSymbols"),
+        "debug builds must keep native symbols through androidComponents.onVariants"
+    );
+    // BuildType has no `packaging`, so a packaging block inside
+    // buildTypes { debug } binds to android.packaging and also keeps the symbol
+    // tables in the release .so that ships on Play (about 10 MB more).
+    assert_eq!(
+        gradle.matches("keepDebugSymbols").count(),
+        debug_only.matches("keepDebugSymbols").count(),
+        "keepDebugSymbols outside the debug-only onVariants block applies to release too"
+    );
+}
+
+#[test]
+fn release_aab_carries_native_debug_symbols_for_play() {
+    let gradle = read("gen/android/app/build.gradle.kts");
+    let release = braced_block(&gradle, r#"getByName("release")"#);
+
+    // Without them Play Console warns on upload and native crash reports show
+    // bare addresses instead of function names.
+    assert!(
+        release.contains(r#"debugSymbolLevel = "SYMBOL_TABLE""#)
+            || release.contains(r#"debugSymbolLevel = "FULL""#),
+        "the release build type must set ndk.debugSymbolLevel"
+    );
+}
+
+#[test]
+fn gradle_pins_the_ndk_version() {
+    let gradle = read("gen/android/app/build.gradle.kts");
+    let android = braced_block(&gradle, "android {");
+    let version = android
+        .split("ndkVersion = \"")
+        .nth(1)
+        .and_then(|rest| rest.split('"').next())
+        .expect("android.ndkVersion must be pinned: it picks the NDK that strips the .so");
+
+    // AGP looks up a side-by-side NDK by its full Pkg.Revision. Pin a stable
+    // release and point NDK_HOME (used for the Rust link) at the same folder.
+    let parts: Vec<&str> = version.split('.').collect();
+    assert!(
+        parts.len() == 3
+            && parts
+                .iter()
+                .all(|part| !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit())),
+        "ndkVersion must be a full revision such as 30.0.16248370, not {version:?}"
+    );
+}
+
+#[test]
+fn android_release_builds_remap_build_machine_paths() {
+    // Panic locations and file!() otherwise ship C:\Users\<name>\.cargo\...
+    // and the checkout path inside the .so. `tauri android build` compiles the
+    // library in the CLI process, so the flags go into that process's env.
+    let package = read("../package.json");
+    assert!(
+        package.contains(r#""tauri": "node scripts/tauri.mjs""#),
+        "`pnpm tauri` must run through app/scripts/tauri.mjs"
+    );
+    let wrapper = read("../scripts/tauri.mjs");
+    assert!(
+        wrapper.contains("CARGO_ENCODED_RUSTFLAGS") && wrapper.contains("--remap-path-prefix="),
+        "app/scripts/tauri.mjs must remap build-machine paths for Android release builds"
+    );
+    // CARGO_ENCODED_RUSTFLAGS replaces the CARGO_TARGET_<TRIPLE>_RUSTFLAGS that
+    // the Tauri CLI sets, so its Android link flags must be carried over.
+    for flag in [
+        "-Clink-arg=-landroid",
+        "-Clink-arg=-llog",
+        "-Clink-arg=-lOpenSLES",
+    ] {
+        assert!(
+            wrapper.contains(flag),
+            "app/scripts/tauri.mjs must keep Tauri's link flag {flag}"
+        );
+    }
+
+    // Gradle refuses a release library that still names this machine, e.g.
+    // after a build that skipped the wrapper (`npx tauri`, `cargo tauri`).
+    let task =
+        read("gen/android/buildSrc/src/main/java/org/example/portty/kotlin/BuildTask.kt");
+    let action = braced_block(&task, "fun assemble()");
+    assert!(
+        action.contains("assertNoBuildMachinePaths()"),
+        "BuildTask must check release libraries for build-machine paths"
+    );
 }
