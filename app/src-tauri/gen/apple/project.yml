@@ -95,7 +95,7 @@ targets:
           - UIInterfaceOrientationPortraitUpsideDown
           - UIInterfaceOrientationLandscapeLeft
           - UIInterfaceOrientationLandscapeRight
-        CFBundleShortVersionString: 0.1.2
+        CFBundleShortVersionString: 0.1.3
         # Kept in step with `bundle.iOS.bundleVersion` in tauri.conf.json, which
         # is what actually patches the built app. Bump BOTH for every upload -
         # App Store Connect rejects a reused build number.
@@ -105,7 +105,7 @@ targets:
         # ios_release_config tests still asserted 1.14). `ios_release_config.rs`
         # is what catches that now - it pins every copy, so a partial bump fails
         # the build instead of shipping a mismatched archive.
-        CFBundleVersion: "1.27"
+        CFBundleVersion: "1.30"
     # NO target-level `entitlements:` block here. It looks like the obvious way
     # to point at the debug file, but xcodegen turns it into a single
     # CODE_SIGN_ENTITLEMENTS for EVERY configuration - silently outranking the
@@ -127,6 +127,11 @@ targets:
         LIBRARY_SEARCH_PATHS[arch=arm64]: $(inherited) $(PROJECT_DIR)/Externals/arm64/$(CONFIGURATION) $(SDKROOT)/usr/lib/swift $(DEVELOPER_DIR)/Toolchains/XcodeDefault.xctoolchain/usr/lib/swift/$(PLATFORM_NAME) $(DEVELOPER_DIR)/Toolchains/XcodeDefault.xctoolchain/usr/lib/swift-5.0/$(PLATFORM_NAME)
         ALWAYS_EMBED_SWIFT_STANDARD_LIBRARIES: true
         EXCLUDED_ARCHS[sdk=iphoneos*]: x86_64
+        # iPhone only. xcodegen's default for an iOS target is "1,2" (iPhone and
+        # iPad), which makes App Store Connect ask for iPad screenshots and offers
+        # the app to iPad users, but the layout is only designed and tested for a
+        # phone. The pbxproj carries the same value - keep them together.
+        TARGETED_DEVICE_FAMILY: "1"
       configs:
         # Both configs set this EXPLICITLY. Release/TestFlight/App Store must use
         # the PRODUCTION APNs environment, else distributed builds register

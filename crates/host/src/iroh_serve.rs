@@ -17,9 +17,10 @@ use iroh::RelayMode;
 use portty_protocol::{CommandOutcome, Frame, PermissionResolver, RequestKind, SessionId};
 use portty_transport::{
     build_endpoint, confirm_server_handshake, encode_compact_ticket, encode_ticket, open_msg,
-    run_server_handshake, seal_msg, DeviceId, EnvelopeCipher, HandshakeCommit, Identity,
-    IrohTransport, IrohWriter, KeyedPairingRateLimiter, PairingSecret, PairingState, PeerStore,
-    SealedEnvelope, ServerHandshake, SharedPairingState, SharedRateLimiter, ENROLLMENT_WINDOW,
+    run_server_handshake, seal_msg, DeviceId, EnvelopeCipher, HandshakeCommit, HandshakeMessage,
+    Identity, IrohTransport, IrohWriter, KeyedPairingRateLimiter, PairingFailure, PairingSecret,
+    PairingState, PeerStore, ProtocolError, ResumedWith, SealedEnvelope, ServerHandshake,
+    SharedPairingState, SharedRateLimiter, SyncError, Transport, TransportError, ENROLLMENT_WINDOW,
 };
 use tokio::sync::{mpsc, Mutex as AsyncMutex};
 use tokio::task::JoinHandle;
@@ -117,6 +118,46 @@ const MAX_STAGING_PER_SOURCE: usize = 2;
 /// Ten seconds is generous for a QUIC handshake plus the first stream; the old
 /// thirty meant one stalled dial squatted a slot for half a minute.
 const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// How long a refused peer gets to read the refusal and hang up before the host
+/// closes the connection itself (see [`IrohTransport::finish_and_close`]).
+///
+/// Dropping the connection straight after a refusal let the close overtake the
+/// refusal, so the phone reported "connection lost" instead of the reason - for a
+/// peer on another protocol version it never got a reason at all. A phone reads
+/// the reply and hangs up within one round trip, so this only bounds a peer that
+/// never does. It is spent inside the slot the connection already holds, and is
+/// shorter than [`HANDSHAKE_TIMEOUT`], which a silent dialer can already take.
+const REFUSAL_LINGER: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// Whether a failed handshake ended by SENDING the peer a refusal: every
+/// `PairingFailed`, and the one reply a peer on another protocol version gets.
+/// Any other failure (I/O, a malformed or out-of-order message) sent nothing, so
+/// there is nothing to deliver and the connection can simply drop.
+fn handshake_sent_refusal(error: &SyncError) -> bool {
+    matches!(
+        error,
+        SyncError::Protocol(ProtocolError::PairingFailed(_))
+            | SyncError::Transport(TransportError::UnsupportedProtocolVersion { .. })
+    )
+}
+
+/// Refuse a pairing AFTER its proof verified, and make sure the reason arrives.
+///
+/// The phone is waiting for `PairingOk` at this point and accepts `PairingFailed`
+/// instead, so it can say why ("declined at the computer", "pairing is no longer
+/// open") rather than "connection lost". The peer already proved the pairing
+/// secret, and the reason is one it could infer anyway, so this reveals nothing.
+///
+/// Best effort, and bounded: the send gets [`REFUSAL_LINGER`] too, so a peer that
+/// withholds flow-control credit cannot park this task while it holds a serving
+/// slot. If the send fails or stalls, dropping is all that is left.
+async fn refuse_after_proof(mut tport: IrohTransport, reason: PairingFailure) {
+    let refusal = HandshakeMessage::PairingFailed { reason };
+    if let Ok(Ok(())) = tokio::time::timeout(REFUSAL_LINGER, tport.send(&refusal)).await {
+        tport.finish_and_close(REFUSAL_LINGER).await;
+    }
+}
 
 /// How many staged handshakes each source currently holds.
 ///
@@ -824,7 +865,7 @@ pub async fn accept_loop(
             // Reload the peer store from disk so a `portty-host revoke` that ran
             // since startup is honored NOW (the revoked token is gone from the
             // file). Cheap: a tiny postcard read, once per connection.
-            let (tokens, observed_revocation) = {
+            let (tokens, grace_tokens, observed_revocation) = {
                 let mut store = peers.lock().await;
                 let fresh = match PeerStore::load(&identity_dir) {
                     Ok(fresh) => fresh,
@@ -834,7 +875,11 @@ pub async fn accept_loop(
                     }
                 };
                 *store = fresh;
-                (store.tokens(), store.revocation_marker(&authed_device_id))
+                (
+                    store.tokens(),
+                    store.grace_tokens(),
+                    store.revocation_marker(&authed_device_id),
+                )
             };
             // The exact credential this handshake may authenticate against, kept
             // aside before `tokens` is handed to the handshake. A resume commits
@@ -854,6 +899,9 @@ pub async fn accept_loop(
             let snapshot = guard.state.lock().unwrap().snapshot();
             let mut hs = ServerHandshake::new(did, host_display_name())
                 .with_resumption_tokens(tokens)
+                // A phone that missed the last rotation may resume once with the
+                // token it still holds; the commit below uses that token up.
+                .with_grace_tokens(grace_tokens)
                 .with_shared_rate_limiter(guard.limiter.clone())
                 .with_rate_limit_key(authed_node_id.to_string())
                 .with_first_pair(guard.state.clone(), snapshot)
@@ -866,7 +914,12 @@ pub async fn accept_loop(
             {
                 Ok(Ok(o)) => o,
                 Ok(Err(e)) => {
-                    error!("handshake failed: {e}");
+                    error!(peer = %authed_device_id, "handshake failed: {e}");
+                    // A refusal the peer never reads is no better than silence:
+                    // close gracefully so it arrives (bounded by REFUSAL_LINGER).
+                    if handshake_sent_refusal(&e) {
+                        tport.finish_and_close(REFUSAL_LINGER).await;
+                    }
                     return;
                 }
                 Err(_) => {
@@ -960,6 +1013,10 @@ pub async fn accept_loop(
                     peer = %outcome.peer_device_id,
                     "refusing first pair: not confirmed at the host"
                 );
+                // Declined, timed out, no `portty pair` to ask, or another
+                // confirmation already waiting: to the phone all of these are
+                // "the computer did not confirm".
+                refuse_after_proof(tport, PairingFailure::Cancelled).await;
                 return;
             }
             // Claim the one-time enrollment opportunity, if this was a first pair.
@@ -978,6 +1035,7 @@ pub async fn accept_loop(
                         "refusing first pair: the enrollment window was already used \
                          or reopened while this handshake ran"
                     );
+                    refuse_after_proof(tport, PairingFailure::PairingClosed).await;
                     return;
                 }
             }
@@ -985,7 +1043,12 @@ pub async fn accept_loop(
             // revocation marker observed before the handshake. A concurrent
             // revoke changes that marker and MUST win; never start an authorized
             // session after a failed commit.
-            let pair_id = match peers.lock().await.commit_handshake(
+            let resumed_with = if outcome.previous_token {
+                ResumedWith::PreviousToken
+            } else {
+                ResumedWith::CurrentToken
+            };
+            let pair_id = match peers.lock().await.commit_host_handshake(
                 outcome.peer_device_id,
                 HandshakeCommit {
                     ticket: None,
@@ -996,6 +1059,7 @@ pub async fn accept_loop(
                     observed_revocation,
                     observed_token,
                 },
+                resumed_with,
             ) {
                 Ok(pair_id) => pair_id,
                 Err(e) => {
@@ -1024,6 +1088,9 @@ pub async fn accept_loop(
                 // token would remove this cliff; it needs peer-store support.)
                 warn!(peer = %outcome.peer_device_id, error = %e, "paired but could not acknowledge the phone; it must re-pair with `portty pair`");
                 return;
+            }
+            if outcome.previous_token {
+                info!(peer = %outcome.peer_device_id, "phone reconnected with its previous token - it had missed the last rotation; that token is now used up");
             }
             info!(peer = %outcome.peer_device_id, name = %outcome.peer_display_name, "phone paired");
             notify_phone_connected(&outcome.peer_display_name);
@@ -2520,6 +2587,44 @@ mod tests {
     use portty_protocol::{CommandOutcome, RequestKind};
     use portty_transport::{run_client_handshake, ClientHandshake, Transport};
     use std::time::Duration;
+
+    /// Only a handshake that SENT a refusal waits for it to be delivered. Every
+    /// `PairingFailed` reason counts, and so does the reply to a peer on another
+    /// protocol version; an I/O error or an out-of-order message sent nothing,
+    /// so it must drop at once rather than hold its slot for the linger.
+    #[test]
+    fn only_a_sent_refusal_waits_to_be_delivered() {
+        for reason in [
+            PairingFailure::WrongPin,
+            PairingFailure::RateLimited,
+            PairingFailure::UnsupportedVersion,
+            PairingFailure::Cancelled,
+            PairingFailure::PairingClosed,
+            PairingFailure::Revoked,
+        ] {
+            assert!(handshake_sent_refusal(&SyncError::Protocol(
+                ProtocolError::PairingFailed(reason)
+            )));
+        }
+        assert!(handshake_sent_refusal(&SyncError::Transport(
+            TransportError::UnsupportedProtocolVersion {
+                expected: 11,
+                found: 12
+            }
+        )));
+        assert!(!handshake_sent_refusal(&SyncError::Transport(
+            TransportError::Closed
+        )));
+        assert!(!handshake_sent_refusal(&SyncError::Transport(
+            TransportError::Io(std::io::Error::other("connection lost"))
+        )));
+        assert!(!handshake_sent_refusal(&SyncError::Protocol(
+            ProtocolError::UnexpectedMessage {
+                state: "AwaitingHello",
+                actual: "PairingProof",
+            }
+        )));
+    }
 
     /// Startup must arm NOTHING. This is the whole fix for "every daemon restart
     /// writes fresh shell-access credentials to service logs": if no secret is

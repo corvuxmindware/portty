@@ -7,10 +7,11 @@ use std::time::Duration;
 use iroh::RelayMode;
 use portty_protocol::Frame;
 use portty_transport::{
-    build_endpoint, confirm_server_handshake, decode_ticket, encode_ticket, open_msg,
-    run_client_handshake, run_server_handshake, seal_msg, ClientHandshake, HandshakeOutcome,
-    Identity, IrohTransport, PairingSecret, ResumptionToken, SealedEnvelope, ServerHandshake,
-    SyncError, Transport, TransportError,
+    build_endpoint, confirm_server_handshake, decode_ticket, encode_ticket, open_msg, read_frame,
+    run_client_handshake, run_server_handshake, seal_msg, write_frame, ClientHandshake,
+    HandshakeMessage, HandshakeOutcome, Identity, IrohTransport, PairingFailure, PairingSecret,
+    ResumptionToken, SealedEnvelope, ServerHandshake, SyncError, Transport, TransportError,
+    PROTOCOL_VERSION, SYNC_ALPN,
 };
 
 /// The out-of-band credential the joiner scanned. Since PROTOCOL_VERSION 8 this
@@ -252,5 +253,106 @@ async fn reconnect_by_token_after_first_pair() {
         Ok(Ok(())) => {}
         Ok(Err(e)) => panic!("resume test failed: {e}"),
         Err(_) => panic!("resume test timed out after 60s"),
+    }
+}
+
+/// A peer on ANOTHER protocol version is told ours, then closed cleanly.
+///
+/// It used to get no answer at all: the host's frame layer refused the Hello
+/// inside `recv` and the connection simply dropped, so the phone could only say
+/// "connection lost". Now the peer reads exactly one frame - stamped with the
+/// host's version, so its own frame layer reports `found: <host version>` and
+/// can name the older side - followed by a clean end of stream rather than a
+/// reset or a lost connection. And the host stops waiting the moment the peer
+/// hangs up, instead of sitting out its whole linger.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_peer_on_another_protocol_version_is_answered_then_closed_cleanly() {
+    let res = tokio::time::timeout(Duration::from_secs(60), async {
+        let host_dir = tempdir()?;
+        let client_dir = tempdir()?;
+        let host_id = Identity::load_or_create(host_dir.path())?;
+        let client_id = Identity::load_or_create(client_dir.path())?;
+        let host_ep = build_endpoint(&host_id, RelayMode::Disabled).await?;
+        let client_ep = build_endpoint(&client_id, RelayMode::Disabled).await?;
+        let port = host_ep
+            .bound_sockets()
+            .into_iter()
+            .find_map(|s| if s.is_ipv4() { Some(s.port()) } else { None })
+            .expect("an IPv4 bound socket");
+        let loopback = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+        let host_addr = iroh::EndpointAddr::new(host_ep.id()).with_ip_addr(loopback);
+
+        // One version ahead (a newer phone) and one behind (an older one).
+        for theirs in [PROTOCOL_VERSION + 1, PROTOCOL_VERSION - 1] {
+            let accept_ep = host_ep.clone();
+            let host_did = host_id.device_id();
+            let server = tokio::spawn(async move {
+                let incoming = accept_ep.accept().await.expect("accept");
+                let conn = incoming.await.expect("incoming");
+                let mut tport = IrohTransport::accept(conn).await?;
+                let mut hs = ServerHandshake::new(host_did, "host".into())
+                    .with_unwindowed_pairing_secrets([ticket_secret()]);
+                let refused = run_server_handshake(&mut tport, &mut hs).await.err();
+                let lingering = std::time::Instant::now();
+                tport.finish_and_close(Duration::from_secs(30)).await;
+                Ok::<_, SyncError>((refused, lingering.elapsed()))
+            });
+
+            // A raw peer: exactly what a Portty build on `theirs` puts on the wire.
+            let conn = client_ep.connect(host_addr.clone(), SYNC_ALPN).await?;
+            let (mut send, mut recv) = conn.open_bi().await?;
+            let hello = HandshakeMessage::Hello {
+                device_id: client_id.device_id().0,
+                protocol_version: theirs,
+                display_name: "phone".into(),
+                client_eph_pub: [9; 32],
+            };
+            write_frame(&mut send, theirs, &postcard::to_allocvec(&hello).unwrap()).await?;
+
+            let (version, payload) = read_frame(&mut recv).await?;
+            assert_eq!(
+                version, PROTOCOL_VERSION,
+                "the reply is stamped with the host's own version"
+            );
+            assert!(matches!(
+                postcard::from_bytes::<HandshakeMessage>(&payload).unwrap(),
+                HandshakeMessage::PairingFailed {
+                    reason: PairingFailure::UnsupportedVersion
+                }
+            ));
+            // Then a clean end of stream (FIN) - not a reset, not a lost connection.
+            let next = read_frame(&mut recv).await;
+            assert!(
+                matches!(next, Err(TransportError::Closed)),
+                "expected a clean end of stream, got {next:?}"
+            );
+            // The side that received the last message hangs up, as QUIC wants.
+            conn.close(0u32.into(), b"done");
+
+            let (refused, lingered) = server.await??;
+            assert!(
+                matches!(
+                    &refused,
+                    Some(SyncError::Transport(TransportError::UnsupportedProtocolVersion {
+                        expected: PROTOCOL_VERSION,
+                        found,
+                    })) if *found == theirs
+                ),
+                "{refused:?}"
+            );
+            assert!(
+                lingered < Duration::from_secs(10),
+                "the host should stop waiting once the peer hangs up; waited {lingered:?}"
+            );
+        }
+        tokio::join!(host_ep.close(), client_ep.close());
+        Ok::<(), Box<dyn std::error::Error>>(())
+    })
+    .await;
+
+    match res {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => panic!("version-reply test failed: {e}"),
+        Err(_) => panic!("version-reply test timed out after 60s"),
     }
 }

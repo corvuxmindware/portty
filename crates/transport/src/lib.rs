@@ -49,6 +49,6 @@ pub use iroh::{
     run_client_handshake_with, run_server_handshake, HandshakeOutcome, IrohReader, IrohTransport,
     IrohWriter, SYNC_ALPN,
 };
-pub use peers::{HandshakeCommit, PairState, PeerRecord, PeerStore, RevocationRecord};
+pub use peers::{HandshakeCommit, PairState, PeerRecord, PeerStore, ResumedWith, RevocationRecord};
 pub use transport::Transport;
 pub use wire::{open, open_msg, seal, seal_msg, SealedEnvelope};

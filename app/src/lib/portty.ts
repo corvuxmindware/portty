@@ -300,7 +300,11 @@ export const pair = (
 
 /// Resume a saved host by the stored token - no ticket or code. `host` (a
 /// device-id hex from `listHosts`) picks a SPECIFIC saved laptop; omitted = most
-/// recent. Rejects if nothing is saved or the token was rejected (then re-pair).
+/// recent.
+///
+/// `pair` and `reconnect` reject with `{ kind, message, detail }`: plain words
+/// worked out from the typed Rust error (src-tauri/src/connect_error.rs).
+/// Read them with `friendlyError` (lib/friendlyError.ts).
 export const reconnect = (onOutput: OutputCb, onSize: SizeCb, host?: string): Promise<void> =>
   invoke<void>("reconnect", { onOutput: outputChannel(onOutput, onSize), host: host ?? null });
 
@@ -370,6 +374,13 @@ export const detach = () => invoke<void>("detach");
 /** Open a link in the system browser instead of navigating the app's webview
  *  away from the SPA (#53). Rust validates the scheme (http/https only). */
 export const openExternal = (url: string) => invoke<void>("open_external_url", { url });
+/** What the About screen shows that only the Rust core knows. The app version
+ *  itself comes from Tauri's `getVersion()`. */
+export interface AppInfo {
+  /** The phone-to-computer wire protocol; both sides must speak the same one. */
+  protocol_version: number;
+}
+export const appInfo = () => invoke<AppInfo>("app_info");
 /// Freeze live output for the viewed session (scroll/read without the cursor
 /// jumping; saves cellular data). Host keeps buffering; `resumeStream` replays.
 export const pauseStream = () => invoke<void>("pause_stream");
@@ -400,6 +411,14 @@ export const newSessionIn = (rel: string, title?: string) =>
  *  know the request at all - callers treat a rejection as `["workspace"]`, which is
  *  exactly what every host did before v10. */
 export const listTerminalRoots = () => invoke<TerminalRoot[]>("list_terminal_roots");
+
+/** Prove the link still reaches the host: one round trip, resolving only on an
+ *  answer. Needed because a write to a dead link does NOT fail - it lands in the
+ *  local QUIC send buffer, and the phone learns the link is gone only at its own
+ *  idle timeout. Rides the folder-roots query: read-only, answered inline with
+ *  no disk access, and known to every host that can connect at all (the
+ *  protocol's oldest supported version is its newest). */
+export const pingHost = (): Promise<void> => listTerminalRoots().then(() => undefined);
 
 /** Browse directories inside a chosen root. `rel` is relative to it; `""` is the
  *  root itself. The host re-resolves and re-checks containment, so a phone still
@@ -511,10 +530,22 @@ export const uploadFile = (
   remotePath: string,
   allowOutsideHome = false,
 ) => invoke<number>("upload_file", { localPath, remotePath, allowOutsideHome });
+/** The host file name to offer for a picked upload. Android's picker returns a
+ *  `content://` URI whose last segment is an opaque document id, not a name, so
+ *  the core asks the document's provider what it is called. iOS's returns a
+ *  `file://` URL whose name is percent-escaped, which the core decodes. */
+export const suggestUploadName = (localPath: string) =>
+  invoke<string>("suggest_upload_name", { localPath });
+/** Resolves once the host has started to serve `remotePath`; rejects with the
+ *  host's reason. Asked before the Save dialog, which creates the destination
+ *  file the moment the user taps Save - on some phones beyond removing again. */
+export const probeDownload = (remotePath: string, allowOutsideHome = false) =>
+  invoke<void>("probe_download", { remotePath, allowOutsideHome });
 export const kill = (id: number) => invoke<void>("kill", { id });
 /// Give a session a custom name. The host re-sends the list (→ `portty://list`).
 export const rename = (id: number, title: string) => invoke<void>("rename", { id, title });
-export const disconnect = () => invoke<void>("disconnect");
+/** Drop the link. `false`: there was none, and no `disconnected` event follows. */
+export const disconnect = () => invoke<boolean>("disconnect");
 /// Consume the wake blob a tapped push notification left behind (if any):
 /// resolves with the paired host's device-id hex to reconnect to, or null.
 export const consumePushWake = () => invoke<string | null>("consume_push_wake");
@@ -611,4 +642,9 @@ export function onTransferError(
   cb: (error: { id: number; message: string }) => void,
 ): Promise<UnlistenFn> {
   return listen<{ id: number; message: string }>("portty://transfer-error", (e) => cb(e.payload));
+}
+/** An addendum to a transfer's outcome, such as an empty file the Save dialog
+ *  made that could not be removed again. */
+export function onTransferNote(cb: (note: { message: string }) => void): Promise<UnlistenFn> {
+  return listen<{ message: string }>("portty://transfer-note", (e) => cb(e.payload));
 }

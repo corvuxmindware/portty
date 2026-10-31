@@ -53,6 +53,7 @@ portty-peers.dat
 portty-last-host.dat
 portty-pair-state-v1.dat
 portty-revocations-v1.dat
+portty-grace-v1.dat
 # Credential staging files now carry a random suffix (credential.tmp-<hex>).
 *.credential.tmp
 *.credential.tmp-*

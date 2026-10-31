@@ -196,6 +196,15 @@ body::before {
   top: 0 !important;
   width: 100% !important;
   height: 100% !important;
+  /* Never zero (release check S15). The 100% above is measured against
+     .xterm-helpers, which has no size of its own, so in practice the box
+     collapses to 0x0 - taps reach the terminal, whose tap handler focuses this
+     textarea instead (focusTerm). A textarea with a zero width OR height makes
+     Chrome put the caret back at the start after every keyboard-app commit:
+     hardware-keyboard text piles up backwards ("echo" became "ohce") and
+     xterm's composition handling then reads the wrong slice. 1px is enough. */
+  min-width: 1px !important;
+  min-height: 1px !important;
   opacity: 0 !important;
   z-index: 10 !important;
   caret-color: transparent !important;
@@ -809,6 +818,12 @@ body::before {
   top: calc(env(safe-area-inset-top) + 3.5rem);
   left: 50%;
   transform: translateX(-50%);
+  /* Sized to its text, not to the half-screen that `left: 50%` leaves it - that
+     wrapped even "Reconnected - session restored" on a 360px-wide phone. A
+     message too long for 85vw still wraps, centred, rather than being cut. */
+  width: max-content;
+  max-width: min(85vw, 26rem);
+  text-align: center;
   border: 1px solid rgb(var(--lime-rgb) / 0.35);
   border-radius: 999px;
   padding: 0.45rem 0.75rem;
@@ -827,6 +842,59 @@ body::before {
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
+}
+/* Terminal link being checked or rebuilt: typing is held, not lost. Persistent
+   while it lasts, in the reconnect toast's slot (that toast only follows once
+   this is gone). Amber edge, not lime - a state to notice, not a success.
+   Click-through, so it never eats a tap meant for the header or terminal. */
+.portty-link-banner {
+  position: fixed;
+  z-index: 50;
+  top: calc(env(safe-area-inset-top) + 3.5rem);
+  left: 50%;
+  transform: translateX(-50%);
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  max-width: min(85vw, 26rem);
+  border: 1px solid color-mix(in srgb, var(--amber) 45%, transparent);
+  border-radius: 999px;
+  padding: 0.4rem 0.75rem;
+  background: rgba(10, 10, 10, 0.94);
+  color: var(--text-1);
+  font-size: 0.72rem;
+  box-shadow: 0 8px 30px rgba(0, 0, 0, 0.45);
+  pointer-events: none;
+}
+.portty-link-banner-text {
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.portty-link-banner .portty-term-spinner {
+  flex: none;
+  width: 0.85rem;
+  height: 0.85rem;
+}
+/* Most checks answer within one round trip; only a slow one shows at all, so a
+   healthy resume does not flash a banner. */
+.portty-link-banner--checking {
+  animation: portty-link-banner-in 0.2s ease 0.6s both;
+}
+@keyframes portty-link-banner-in {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  /* Keep the delay (it is about flicker, not motion); drop the fade. */
+  .portty-link-banner--checking {
+    animation-duration: 1ms;
+  }
 }
 
 /* ── Agent header controls ─────────────────────────────────────────────
@@ -1162,6 +1230,28 @@ body::before {
   padding: 0.85rem 1rem;
   border-top: 1px solid var(--border);
   background: linear-gradient(180deg, transparent, rgba(0, 0, 0, 0.5));
+}
+/* An open folder or agent picker can be taller than the screen: a folder with
+   saved agent conversations stacks two bounded lists under both footer buttons,
+   and on a 402x874 iPhone that put "Start new" below the bottom edge, where
+   nothing could scroll to it. While a picker is open the footer shrinks to the
+   space left and scrolls on its own, and the commit row stays pinned in view.
+   Only then: overflow clips the buttons' glow, which the closed footer keeps.
+   The footer's bottom padding moves onto the pinned row - WebKit pins a sticky
+   box inside the scroller's padding, so the list showed through below it. */
+.portty-footer--picker {
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding-bottom: 0;
+}
+.portty-footer--picker .portty-dir-actions {
+  position: sticky;
+  bottom: 0;
+  z-index: 1;
+  padding-top: 0.5rem;
+  padding-bottom: 0.85rem;
+  background: var(--bg);
 }
 .portty-new-session-btn {
   width: 100%;
@@ -1576,6 +1666,12 @@ body::before {
   color: var(--text-2);
   text-decoration: underline;
   text-underline-offset: 2px;
+}
+.portty-pair-links {
+  display: flex;
+  justify-content: center;
+  gap: 1.5rem;
+  padding-block: 0.25rem;
 }
 .portty-btn-with-icon {
   display: inline-flex;

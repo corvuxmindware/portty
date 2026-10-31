@@ -502,6 +502,12 @@ Checks the PID file and process liveness, then reports the number of currently
 connected devices from the daemon's active-state mirror. A stale PID file is
 reported as not running.
 
+It also prints where the background daemon's log is. A daemon started in the
+background has no terminal, so it writes its log to `portty-host.log` in the data
+directory: owner-only, and capped at 1 MiB before it moves to `portty-host.log.1`.
+The log holds no pairing tickets, PINs or tokens. `--foreground` keeps logging to
+the terminal only.
+
 ### `portty-host stop`
 
 ```text
@@ -899,7 +905,8 @@ portty-host peers
 ```
 
 If the daemon is stopped, run `portty-host`. If the phone was revoked, run
-`portty pair` to open an explicit repair window and pair again.
+`portty pair` to open an explicit repair window and pair again. If it keeps
+refusing the phone, the `Background log:` file that `status` prints says why.
 
 ### `portty share` says it is local-only
 

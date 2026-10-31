@@ -220,6 +220,177 @@ pub fn resolve_within(root: &Path, rel: &str) -> Result<PathBuf, WorkspaceError>
     Ok(resolved)
 }
 
+/// The spelling of an absolute path to hand to ANOTHER program: a shell's
+/// working directory, or the directory an agent is asked about.
+///
+/// [`resolve_within`] and every other `canonicalize` in the host produce, on
+/// Windows, the verbatim form - `\\?\C:\w\app`, or `\\?\UNC\server\share\app` on
+/// a network share. Windows' own file APIs accept it; programs often do not.
+/// cmd.exe reads a working directory that starts `\\` as a UNC path it cannot
+/// use, prints "UNC paths are not supported. Defaulting to Windows directory."
+/// and starts in `C:\Windows` instead. That was every phone terminal on Windows,
+/// because portable-pty passes the directory to Windows exactly as given.
+/// (`std::process::Command` strips the prefix itself when it safely can, by
+/// much the same rules as these.)
+///
+/// Rewritten only when the plain spelling provably names the same place (see
+/// [`verbatim::plain`]); anything else comes back unchanged, which is no
+/// worse than before. A network share stays a UNC path either way, and cmd.exe
+/// refuses those too - other programs do not. Unix has no verbatim form, so this
+/// is the identity there: a Unix path that starts `\\?\` is an ordinary name.
+///
+/// A spelling for the OS boundary only. Containment checks keep comparing the
+/// canonical form, so nothing here is ever an input to `starts_with`.
+pub fn plain_spelling(path: &Path) -> PathBuf {
+    #[cfg(windows)]
+    {
+        use std::ffi::OsString;
+        use std::os::windows::ffi::{OsStrExt as _, OsStringExt as _};
+        // Through UTF-16, not `to_string_lossy`: a Windows path need not be
+        // valid Unicode, and the lossy form would hand a program a path with
+        // U+FFFD where its real characters used to be.
+        let wide: Vec<u16> = path.as_os_str().encode_wide().collect();
+        if let Some(plain) = verbatim::plain(&wide) {
+            return PathBuf::from(OsString::from_wide(&plain));
+        }
+    }
+    path.to_path_buf()
+}
+
+/// The rules for undoing the verbatim prefix, on raw UTF-16.
+///
+/// Platform-independent on purpose, so they are tested on every OS. Outside
+/// tests only [`plain_spelling`] uses them, and only on Windows - hence the
+/// `dead_code` allowance everywhere else.
+#[cfg_attr(not(windows), allow(dead_code))]
+mod verbatim {
+    /// Longest plain directory this will produce, in UTF-16 units.
+    ///
+    /// Windows limits a working directory to `MAX_PATH - 2` characters unless the
+    /// machine opted in to long paths; the verbatim form is exempt. A longer path
+    /// keeps its verbatim spelling rather than become one Windows may refuse.
+    pub(super) const MAX_PLAIN_DIR_UNITS: usize = 258;
+
+    const BACKSLASH: u16 = b'\\' as u16;
+    /// `\\?\`
+    const PREFIX: [u16; 4] = [BACKSLASH, BACKSLASH, b'?' as u16, BACKSLASH];
+    /// `UNC\`, right after the prefix. Upper case only: that is what
+    /// `canonicalize` produces, and anything else is left alone.
+    const UNC: [u16; 4] = [b'U' as u16, b'N' as u16, b'C' as u16, BACKSLASH];
+    /// Characters Win32 refuses inside a name (control characters are checked
+    /// separately).
+    const FORBIDDEN_IN_NAME: &[u8] = b"<>:\"/\\|?*";
+
+    /// The plain spelling of a Windows verbatim path - or `None` when it has none
+    /// that means the same thing.
+    ///
+    /// - `\\?\C:\x` becomes `C:\x`: a drive letter, a colon, then the root.
+    /// - `\\?\UNC\server\share\x` becomes `\\server\share\x`.
+    /// - Everything else is `None`: a path that is not verbatim, the `\\.\`
+    ///   device namespace, `\\?\Volume{...}` and `\\?\GLOBALROOT` (no plain
+    ///   form), and a bare `\\?\C:`, whose plain form would be the
+    ///   drive-RELATIVE `C:`.
+    ///
+    /// Verbatim paths skip Win32 normalization, so they can name things a plain
+    /// path cannot: a component with a trailing dot or space (normalization
+    /// strips it), a reserved device name such as `NUL`, `CON` or `COM1` (it
+    /// would open the device), `.` or `..` (it would be resolved), or a character
+    /// Win32 rejects. Any of those, an empty component, or a result too long for
+    /// a working directory keeps the verbatim spelling.
+    pub(super) fn plain(wide: &[u16]) -> Option<Vec<u16>> {
+        let rest = wide.strip_prefix(&PREFIX[..])?;
+        let plain = if let Some(tail) = rest.strip_prefix(&UNC[..]) {
+            // `server\share` first, then the path inside the share.
+            let mut parts = tail.split(|&c| c == BACKSLASH);
+            let server = parts.next()?;
+            let share = parts.next()?;
+            if !component_ok(server) || !component_ok(share) || !components_ok(parts) {
+                return None;
+            }
+            let mut plain = vec![BACKSLASH, BACKSLASH];
+            plain.extend_from_slice(tail);
+            plain
+        } else {
+            // `C:\` and then the path. The root backslash is required: without
+            // it, `C:x` would mean "x in drive C's current directory".
+            let tail = match rest {
+                [letter, colon, root, tail @ ..]
+                    if u8::try_from(*letter).is_ok_and(|b| b.is_ascii_alphabetic())
+                        && *colon == u16::from(b':')
+                        && *root == BACKSLASH =>
+                {
+                    tail
+                }
+                _ => return None,
+            };
+            if !tail.is_empty() && !components_ok(tail.split(|&c| c == BACKSLASH)) {
+                return None;
+            }
+            rest.to_vec()
+        };
+        (plain.len() <= MAX_PLAIN_DIR_UNITS).then_some(plain)
+    }
+
+    /// Every component survives Win32 normalization unchanged. One trailing
+    /// empty component (a trailing backslash) is allowed; any other is not.
+    fn components_ok<'a>(parts: impl Iterator<Item = &'a [u16]>) -> bool {
+        let mut parts = parts.peekable();
+        while let Some(part) = parts.next() {
+            if part.is_empty() && parts.peek().is_none() {
+                return true;
+            }
+            if !component_ok(part) {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// One path component that means the same thing with or without `\\?\`.
+    fn component_ok(part: &[u16]) -> bool {
+        // Empty is not a name; `.`, `..` and any other trailing dot or space
+        // would be resolved or stripped by normalization.
+        let Some(&last) = part.last() else {
+            return false;
+        };
+        if last == u16::from(b'.') || last == u16::from(b' ') {
+            return false;
+        }
+        let forbidden =
+            |c: u16| c < 0x20 || u8::try_from(c).is_ok_and(|b| FORBIDDEN_IN_NAME.contains(&b));
+        !part.iter().any(|&c| forbidden(c)) && !is_reserved_device_name(part)
+    }
+
+    /// `CON`, `NUL`, `COM1` and the rest, matched the way Windows matches them:
+    /// ignoring case, and ignoring everything from the first dot (`nul.txt` is
+    /// still the device) along with any spaces before it.
+    fn is_reserved_device_name(part: &[u16]) -> bool {
+        let stem_end = part
+            .iter()
+            .position(|&c| c == u16::from(b'.'))
+            .unwrap_or(part.len());
+        let stem = String::from_utf16_lossy(&part[..stem_end]);
+        let stem = stem.trim_end_matches(' ').to_ascii_uppercase();
+        if matches!(
+            stem.as_str(),
+            "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$"
+        ) {
+            return true;
+        }
+        // COM0-9 and LPT0-9, plus the superscript digits Windows also treats as
+        // port numbers (COM¹, LPT³).
+        ["COM", "LPT"].iter().any(|port| {
+            stem.strip_prefix(port).is_some_and(|digit| {
+                let mut chars = digit.chars();
+                matches!(
+                    (chars.next(), chars.next()),
+                    (Some('0'..='9' | '¹' | '²' | '³'), None)
+                )
+            })
+        })
+    }
+}
+
 /// Immediate child directory names of `rel`, sorted and capped.
 ///
 /// Only directories, and only ones that survive [`resolve_within`] themselves -
@@ -473,5 +644,168 @@ mod tests {
             list_dirs(root.path(), "nope"),
             Err(WorkspaceError::Io(_))
         ));
+    }
+
+    fn wide(text: &str) -> Vec<u16> {
+        text.encode_utf16().collect()
+    }
+
+    /// `verbatim::plain` on a `&str`, for readable assertions.
+    fn plain(text: &str) -> Option<String> {
+        verbatim::plain(&wide(text)).map(|units| String::from_utf16(&units).unwrap())
+    }
+
+    /// The two shapes `canonicalize` produces on Windows lose their prefix, and
+    /// nothing else about them changes.
+    #[test]
+    fn verbatim_drive_and_unc_paths_get_their_plain_spelling() {
+        assert_eq!(plain(r"\\?\C:\w\app").as_deref(), Some(r"C:\w\app"));
+        assert_eq!(plain(r"\\?\C:\").as_deref(), Some(r"C:\"));
+        assert_eq!(
+            plain(r"\\?\d:\Projects\portty\").as_deref(),
+            Some(r"d:\Projects\portty\")
+        );
+        assert_eq!(
+            plain(r"\\?\C:\Users\Zoë\my app").as_deref(),
+            Some(r"C:\Users\Zoë\my app")
+        );
+        assert_eq!(
+            plain(r"\\?\UNC\server\share\x").as_deref(),
+            Some(r"\\server\share\x")
+        );
+        assert_eq!(
+            plain(r"\\?\UNC\server\share").as_deref(),
+            Some(r"\\server\share")
+        );
+    }
+
+    /// Anything that is not one of those two shapes is left exactly as it is.
+    #[test]
+    fn paths_that_are_not_verbatim_drive_or_unc_are_left_alone() {
+        for untouched in [
+            r"C:\w\app",
+            r"\\server\share\x",
+            "/home/me/app",
+            "",
+            r"\\?\",
+            // Its plain form would be the drive-RELATIVE `C:`.
+            r"\\?\C:",
+            r"\\?\C:x",
+            r"\\?\1:\x",
+            // The device namespace, and verbatim forms with no plain spelling.
+            r"\\.\C:\x",
+            r"\\?\Volume{1b3b1146-4076-11e3-8b1b-806e6f6e6963}\x",
+            r"\\?\GLOBALROOT\Device\HarddiskVolume1\x",
+            // Only the spelling `canonicalize` itself produces.
+            r"\\?\unc\server\share\x",
+            // A UNC path needs a server AND a share.
+            r"\\?\UNC\server",
+            r"\\?\UNC\\share\x",
+            // These would turn into the `\\.\` device namespace or back into a
+            // verbatim path once the prefix is gone.
+            r"\\?\UNC\.\pipe\x",
+            r"\\?\UNC\?\C:\x",
+        ] {
+            assert_eq!(plain(untouched), None, "{untouched:?} must stay as it is");
+        }
+    }
+
+    /// A component a plain path cannot express keeps the verbatim spelling:
+    /// dropping the prefix would quietly change what the path names.
+    #[test]
+    fn names_a_plain_path_would_reinterpret_keep_the_prefix() {
+        for verbatim_only in [
+            r"\\?\C:\w\trailing.",
+            r"\\?\C:\w\trailing ",
+            r"\\?\C:\w\..\x",
+            r"\\?\C:\w\.\x",
+            r"\\?\C:\w\\x",
+            r"\\?\C:\w/x",
+            r"\\?\C:\w\a:b",
+            r"\\?\C:\w\NUL",
+            r"\\?\C:\w\nul.txt",
+            r"\\?\C:\w\con .txt",
+            r"\\?\C:\w\COM1",
+            r"\\?\C:\w\lpt9.log",
+            r"\\?\C:\w\COM¹",
+            r"\\?\C:\w\CONIN$",
+            r"\\?\UNC\server\share\aux",
+        ] {
+            assert_eq!(
+                plain(verbatim_only),
+                None,
+                "{verbatim_only:?} only means what it says with the prefix"
+            );
+        }
+        // Near misses are ordinary names and DO get the plain spelling.
+        for ordinary in [
+            r"\\?\C:\w\COM10",
+            r"\\?\C:\w\console",
+            r"\\?\C:\w\nullable",
+            r"\\?\C:\w\LPT",
+            r"\\?\C:\w\.git",
+            r"\\?\C:\w\a.b.c",
+        ] {
+            assert!(
+                plain(ordinary).is_some(),
+                "{ordinary:?} is an ordinary name"
+            );
+        }
+    }
+
+    /// A plain path longer than a working directory may be keeps its prefix:
+    /// the verbatim form is the one that still works at that length.
+    #[test]
+    fn a_path_too_long_for_a_working_directory_keeps_the_prefix() {
+        let longest = verbatim::MAX_PLAIN_DIR_UNITS;
+        let fits = format!(r"\\?\C:\{}", "a".repeat(longest - 3));
+        assert_eq!(plain(&fits).map(|p| p.len()), Some(longest));
+        let too_long = format!(r"\\?\C:\{}", "a".repeat(longest - 2));
+        assert_eq!(plain(&too_long), None);
+    }
+
+    /// Windows names need not be valid Unicode. The rewrite works on raw UTF-16,
+    /// so an unpaired surrogate comes through untouched instead of as U+FFFD.
+    #[test]
+    fn a_name_that_is_not_valid_unicode_survives_unchanged() {
+        let mut path = wide(r"\\?\C:\w\");
+        path.push(0xD800);
+        path.extend(wide("x"));
+        let mut want = wide(r"C:\w\");
+        want.push(0xD800);
+        want.extend(wide("x"));
+        assert_eq!(verbatim::plain(&path), Some(want));
+    }
+
+    /// Off Windows the spelling is the path itself - even one that looks
+    /// verbatim, which on Unix is just an unusual name.
+    #[cfg(not(windows))]
+    #[test]
+    fn plain_spelling_is_the_identity_off_windows() {
+        for path in [r"\\?\C:\w\app", "/home/me/app"] {
+            assert_eq!(plain_spelling(Path::new(path)), Path::new(path));
+        }
+    }
+
+    /// On a real directory: `canonicalize` hands back the verbatim form, and its
+    /// plain spelling has no prefix yet still names the very same directory.
+    /// (Whether a shell then starts there is pinned end to end, through ConPTY,
+    /// in `session`.)
+    #[cfg(windows)]
+    #[test]
+    fn a_canonical_directory_gets_a_plain_spelling_of_the_same_place() {
+        let dir = tempfile::tempdir().unwrap();
+        let canonical = dir.path().canonicalize().unwrap();
+        assert!(
+            canonical.to_string_lossy().starts_with(r"\\?\"),
+            "canonicalize is verbatim on Windows: {canonical:?}"
+        );
+        let plain = plain_spelling(&canonical);
+        assert!(!plain.to_string_lossy().starts_with(r"\\"), "{plain:?}");
+        assert_eq!(
+            plain.canonicalize().unwrap(),
+            canonical,
+            "a different spelling of the same directory"
+        );
     }
 }

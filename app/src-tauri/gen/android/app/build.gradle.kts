@@ -26,11 +26,17 @@ val keyProperties = Properties().apply {
 
 android {
     compileSdk = 36
+    // The NDK that strips the release .so and extracts its Play debug symbols.
+    // Pin a STABLE release (never a beta), installed side by side under
+    // $ANDROID_HOME/ndk/<version>, and point NDK_HOME - the NDK the Rust code
+    // is compiled and linked with - at the same folder. Bump both together
+    // (packaging/ANDROID_BUILD_RUNBOOK.md, "Native library and NDK").
+    ndkVersion = "30.0.16248370"
     namespace = "org.example.portty"
     defaultConfig {
         manifestPlaceholders["usesCleartextTraffic"] = "false"
         applicationId = "org.example.portty"
-        minSdk = 24
+        minSdk = 29
         targetSdk = 36
         versionCode = tauriProperties.getProperty("tauri.android.versionCode", "1").toInt()
         versionName = tauriProperties.getProperty("tauri.android.versionName", "1.0")
@@ -51,11 +57,10 @@ android {
             isDebuggable = true
             isJniDebuggable = true
             isMinifyEnabled = false
-            packaging {                jniLibs.keepDebugSymbols.add("*/arm64-v8a/*.so")
-                jniLibs.keepDebugSymbols.add("*/armeabi-v7a/*.so")
-                jniLibs.keepDebugSymbols.add("*/x86/*.so")
-                jniLibs.keepDebugSymbols.add("*/x86_64/*.so")
-            }
+            // Debug keeps its native symbols through androidComponents below.
+            // Never add a packaging {} block here: BuildType has no packaging,
+            // so it binds to android.packaging and the RELEASE .so would ship
+            // unstripped too (about 10 MB of symbol tables).
         }
         getByName("release") {
             signingConfig =
@@ -66,6 +71,13 @@ android {
                     .plus(getDefaultProguardFile("proguard-android-optimize.txt"))
                     .toList().toTypedArray()
             )
+            // The .so ships stripped; its symbol table goes into the AAB
+            // instead (BUNDLE-METADATA/com.android.tools.build.debugsymbols),
+            // so Play Console can name the functions in native crash reports.
+            // FULL would add nothing: release Rust builds carry no DWARF.
+            ndk {
+                debugSymbolLevel = "SYMBOL_TABLE"
+            }
         }
     }
     kotlinOptions {
@@ -73,6 +85,17 @@ android {
     }
     buildFeatures {
         buildConfig = true
+    }
+}
+
+// Only DEBUG builds keep native debug symbols in the .so, so Rust backtraces
+// and crash dumps on a test phone show function names. AGP's DSL has no
+// per-build-type packaging, hence the variant API.
+androidComponents {
+    onVariants(selector().withBuildType("debug")) { variant ->
+        for (abi in listOf("arm64-v8a", "armeabi-v7a", "x86", "x86_64")) {
+            variant.packaging.jniLibs.keepDebugSymbols.add("*/$abi/*.so")
+        }
     }
 }
 

@@ -6,8 +6,10 @@ Portty's desktop-side product is a CLI distribution containing two executables:
 - `portty-host` - runs the paired-device daemon.
 
 When distributing the executables, include the root `LICENSE`, `NOTICE`, and
-`THIRD-PARTY-NOTICES.txt` with each archive. The mobile app also bundles font
-license files under `app/src/assets/fonts/`.
+`THIRD-PARTY-NOTICES.txt` with each archive. The mobile app carries its own
+notices in `app/public/third-party-notices.txt` (shown under About Portty →
+Open-source licences), built from the font licence files under
+`app/src/assets/fonts/` and the app's Rust, JavaScript and Android dependencies.
 
 For the local Mac CLI installation plus the iOS archive and TestFlight upload
 workflow, follow the

@@ -31,6 +31,7 @@ use tokio::task::JoinHandle;
 use tracing_subscriber::EnvFilter;
 
 mod active;
+mod daemon_log;
 mod error;
 mod file_transfer;
 mod iroh_serve;
@@ -212,16 +213,53 @@ fn main() -> HostResult<()> {
         iroh_serve::DETACHED.store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
-        )
-        .init();
+    init_tracing(iroh_serve::DETACHED.load(std::sync::atomic::Ordering::Relaxed));
 
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
-    rt.block_on(run_mode(mode, revoke_target))
+    let result = rt.block_on(run_mode(mode, revoke_target));
+    // Each terminal's reader thread blocks on its PTY until the shell exits, and
+    // dropping the runtime waits for every such thread. So `portty-host stop`
+    // with a phone terminal still open used to leave the daemon running (on
+    // Windows, cmd.exe keeps its ConPTY open) and `stop` gave up after 5 s.
+    // Everything that needs an orderly end - the pid file, the keep-awake child -
+    // was released when `run_mode` returned, so the readers are not waited for.
+    rt.shutdown_timeout(std::time::Duration::from_secs(2));
+    result
+}
+
+/// Log to stdout as always; a background host ALSO logs to its owner-only,
+/// size-bounded file, because its stdout ends up on /dev/null (see `daemon_log`).
+fn init_tracing(detached: bool) {
+    use tracing_subscriber::layer::SubscriberExt;
+    use tracing_subscriber::util::SubscriberInitExt;
+
+    let file = if detached {
+        match daemon_log::RotatingLog::open(&app_data_dir()) {
+            Ok(log) => Some(log),
+            Err(e) => {
+                eprintln!("portty-host: could not open the background log file: {e}");
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let log_path = file.as_ref().map(|log| log.path().to_path_buf());
+    tracing_subscriber::registry()
+        .with(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
+        .with(tracing_subscriber::fmt::layer())
+        .with(file.map(daemon_log::layer))
+        .init();
+    if let Some(path) = log_path {
+        tracing::info!(
+            version = env!("CARGO_PKG_VERSION"),
+            pid = std::process::id(),
+            log = %path.display(),
+            "background host started"
+        );
+    }
 }
 
 async fn run_mode(mode: String, revoke_target: Option<String>) -> HostResult<()> {
@@ -557,9 +595,23 @@ fn clear_daemon_state(dir: &std::path::Path) {
 }
 
 fn read_pid(dir: &std::path::Path) -> Option<u32> {
-    std::fs::read_to_string(pid_path(dir))
-        .ok()
-        .and_then(|s| s.trim().parse::<u32>().ok())
+    let path = pid_path(dir);
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        // A pid file that portty-host 0.1.3 or older wrote into a FRESH data
+        // folder: it was written before the folder was locked down, and locking
+        // the folder stripped every permission the file had inherited, so nobody
+        // could read it and `status`/`stop` said "not running" while the daemon
+        // ran. The file is still ours, and an owner may always rewrite a
+        // file's permissions - so give it the owner-only ones the rest of the
+        // folder has, and read it.
+        Err(e) if cfg!(windows) && e.kind() == std::io::ErrorKind::PermissionDenied => {
+            portty_transport::secure::restrict_to_current_user(&path).ok()?;
+            std::fs::read_to_string(&path).ok()?
+        }
+        Err(_) => return None,
+    };
+    text.trim().parse::<u32>().ok()
 }
 
 /// Writes the daemon's PID on creation and removes it on clean shutdown (Drop).
@@ -570,8 +622,16 @@ struct PidFile {
 
 impl PidFile {
     fn create(dir: &std::path::Path) -> Option<Self> {
-        if let Err(e) = std::fs::create_dir_all(dir) {
-            tracing::warn!(error = %e, "pidfile: could not create data dir");
+        // Lock the data folder down FIRST - it holds the identity, and the
+        // credential store would do it moments later anyway. Order matters on
+        // Windows: that lock-down installs a protected owner-only ACL, and
+        // applying it to a folder re-derives the inherited permissions of every
+        // file already inside. A pid file written before it inherited everything
+        // it had, so it was left with none: unreadable to `status` and `stop`,
+        // and impossible to overwrite on the next start ("pidfile: could not
+        // write ... Access is denied").
+        if let Err(e) = portty_transport::secure::prepare_secret_dir(dir) {
+            tracing::warn!(error = %e, "pidfile: could not prepare data dir");
             return None;
         }
         let path = pid_path(dir);
@@ -590,7 +650,11 @@ impl PidFile {
                 std::process::exit(0);
             }
         }
-        if let Err(e) = std::fs::write(&path, std::process::id().to_string()) {
+        // Owner-only and explicit, like every other file in this folder, so it
+        // does not depend on what it would inherit - and replacing a stale file
+        // goes through the folder, which the owner controls.
+        let pid = std::process::id().to_string();
+        if let Err(e) = portty_transport::secure::write_owner_only(&path, pid.as_bytes()) {
             tracing::warn!(error = %e, "pidfile: could not write");
             return None;
         }
@@ -619,6 +683,10 @@ fn status_cmd(dir: &std::path::Path) -> HostResult<()> {
         }
         Some(_) => println!("Portty host is NOT running (stale pid file)."),
         None => println!("Portty host is NOT running."),
+    }
+    let log = daemon_log::log_path(dir);
+    if log.exists() {
+        println!("  Background log: {}", log.display());
     }
     Ok(())
 }
@@ -1446,6 +1514,69 @@ mod pidfile_tests {
             assert!(pid_alive(got), "our own pid is alive");
         } // Drop removes the file.
         assert!(read_pid(dir.path()).is_none(), "pid file removed on drop");
+    }
+
+    /// A FRESH data folder: the pid file must still be readable after the folder
+    /// is locked down, which the credential store does right after startup. On
+    /// Windows that lock-down used to strip the file's inherited permissions, so
+    /// `status` and `stop` said "not running" while the daemon ran.
+    #[test]
+    fn pid_file_stays_readable_after_a_fresh_data_dir_is_locked_down() {
+        let parent = tempfile::tempdir().unwrap();
+        let dir = parent.path().join("fresh-data");
+        let _pid = PidFile::create(&dir).expect("create");
+        // What `Identity::load_or_create` -> the credential store does next, and
+        // again on every credential write.
+        portty_transport::secure::prepare_secret_dir(&dir).unwrap();
+        // A plain read FIRST - `read_pid` would repair a stripped file and hide
+        // the bug. The file has to be right in the first place.
+        let plain = std::fs::read_to_string(pid_path(&dir));
+        assert_eq!(
+            plain.as_ref().ok().map(String::as_str),
+            Some(std::process::id().to_string().as_str()),
+            "the pid file must survive the lock-down readable: {plain:?}"
+        );
+        assert_eq!(read_pid(&dir), Some(std::process::id()));
+    }
+
+    /// An EXISTING data folder, locked down by an earlier run, works as before:
+    /// written, read, and removed on a clean shutdown.
+    #[test]
+    fn pid_file_round_trips_in_an_already_locked_down_data_dir() {
+        let parent = tempfile::tempdir().unwrap();
+        let dir = parent.path().join("existing-data");
+        portty_transport::secure::prepare_secret_dir(&dir).unwrap();
+        {
+            let _pid = PidFile::create(&dir).expect("create");
+            portty_transport::secure::prepare_secret_dir(&dir).unwrap();
+            assert_eq!(read_pid(&dir), Some(std::process::id()));
+        }
+        assert_eq!(read_pid(&dir), None, "pid file removed on drop");
+    }
+
+    /// What portty-host 0.1.3 left behind in a fresh data folder on Windows: a
+    /// pid file written BEFORE the lock-down and stripped of every permission by
+    /// it. `status`, `stop` and the next start must all be able to read it again,
+    /// and the next start must be able to replace it.
+    #[cfg(windows)]
+    #[test]
+    fn a_pid_file_an_older_build_left_unreadable_is_repaired() {
+        let parent = tempfile::tempdir().unwrap();
+        let dir = parent.path().join("old-data");
+        std::fs::create_dir_all(&dir).unwrap();
+        // The old order: a plain write first, the lock-down after. A pid that is
+        // not running, as after a daemon that was killed.
+        std::fs::write(pid_path(&dir), "999999999").unwrap();
+        portty_transport::secure::prepare_secret_dir(&dir).unwrap();
+        // Guard the guard: this really is the unreadable file from the field.
+        let denied = std::fs::read_to_string(pid_path(&dir)).unwrap_err();
+        assert_eq!(denied.kind(), std::io::ErrorKind::PermissionDenied);
+
+        assert_eq!(read_pid(&dir), Some(999_999_999), "status/stop can read it");
+        let pid_file = PidFile::create(&dir).expect("the next start can replace it");
+        assert_eq!(read_pid(&dir), Some(std::process::id()));
+        drop(pid_file);
+        assert!(!pid_path(&dir).exists(), "removed on a clean shutdown");
     }
 
     #[test]

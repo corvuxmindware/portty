@@ -7,8 +7,12 @@
 //!
 //! The token is **rotated** on every successful handshake (each session derives
 //! a fresh token both sides persist), which bounds the window if a token leaks.
-//! If a reconnect's persist is one-sided (connection drops mid-rotation) the
-//! next attempt simply fails and degrades to a re-pair - never a security hole.
+//! The two sides cannot persist a rotation atomically: the host commits first,
+//! and a phone that never hears back (a dropped link, an app suspended as the
+//! screen locks, a failed Keychain write) keeps the old token. The host therefore
+//! keeps the token that authenticated each resume as a one-use grace credential
+//! ([`GRACE_RECORD`]), so that phone's next reconnect heals instead of being
+//! refused until the user re-pairs.
 //!
 //! The token is secret material: never log it, store only in a per-user dir.
 
@@ -22,8 +26,8 @@ use subtle::ConstantTimeEq;
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
 use crate::credential_store::{
-    CredentialStore, Durability, FileCredentialStore, LAST_HOST_RECORD, PAIR_STATE_RECORD,
-    PEERS_RECORD, REVOCATIONS_RECORD,
+    CredentialStore, Durability, FileCredentialStore, GRACE_RECORD, LAST_HOST_RECORD,
+    PAIR_STATE_RECORD, PEERS_RECORD, REVOCATIONS_RECORD,
 };
 use crate::handshake::{PairEventKey, PairId, ResumptionToken};
 use crate::identity::DeviceId;
@@ -65,6 +69,35 @@ impl std::fmt::Debug for HandshakeCommit {
                 "observed_token",
                 &self.observed_token.as_ref().map(|_| "<redacted>"),
             )
+            .finish()
+    }
+}
+
+/// Which stored token a host-side resume proved. See
+/// [`PeerStore::commit_host_handshake`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResumedWith {
+    /// The token on record - the ordinary reconnect.
+    CurrentToken,
+    /// The token from one rotation ago: the phone missed the last rotation.
+    PreviousToken,
+}
+
+/// The token a peer authenticated its last resume with, kept for exactly one
+/// more reconnect. Bound to the pair generation it belongs to, so a re-pair or a
+/// revoke can never leave it usable.
+#[derive(Clone, Serialize, Deserialize)]
+struct GraceToken {
+    pair_id: PairId,
+    /// Secret. `ResumptionToken` wipes itself on drop.
+    token: ResumptionToken,
+}
+
+impl std::fmt::Debug for GraceToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GraceToken")
+            .field("pair_id", &self.pair_id)
+            .field("token", &"<redacted>")
             .finish()
     }
 }
@@ -133,6 +166,9 @@ pub struct PeerStore {
     map: HashMap<DeviceId, PeerRecord>,
     pair_state: HashMap<DeviceId, PairState>,
     revocations: HashMap<DeviceId, RevocationRecord>,
+    /// Host only: the previous token per peer. Empty on a phone, which never
+    /// writes the record.
+    grace: HashMap<DeviceId, GraceToken>,
     last_connected: Option<DeviceId>,
     store: Arc<dyn CredentialStore>,
 }
@@ -143,6 +179,7 @@ impl std::fmt::Debug for PeerStore {
             .field("peer_count", &self.map.len())
             .field("pair_state_count", &self.pair_state.len())
             .field("revocation_count", &self.revocations.len())
+            .field("grace_count", &self.grace.len())
             .field("last_connected", &self.last_connected)
             .field("store", &"<credential-store>")
             .finish()
@@ -199,10 +236,22 @@ impl PeerStore {
             }
             None => HashMap::new(),
         };
+        // A corrupt grace record loads as "no grace": every peer is then held to
+        // its current token alone, which is how this worked before the record
+        // existed. Unlike revocations, losing it can only refuse, never admit.
+        let grace = match store.read(GRACE_RECORD)? {
+            Some(mut b) => {
+                let parsed = postcard::from_bytes(&b).unwrap_or_default();
+                b.zeroize();
+                parsed
+            }
+            None => HashMap::new(),
+        };
         Ok(Self {
             map,
             pair_state,
             revocations,
+            grace,
             last_connected,
             store,
         })
@@ -234,6 +283,19 @@ impl PeerStore {
             return None;
         }
         self.map.get(id).map(|r| r.token.clone())
+    }
+
+    /// Snapshot of the previous tokens a host-side handshake may also accept, one
+    /// reconnect each. Only for a peer that is not revoked, still holds a current
+    /// token, and is still on the pair generation the grace token belongs to - so
+    /// a stale record left by an interrupted cleanup can never authenticate.
+    pub fn grace_tokens(&self) -> HashMap<DeviceId, ResumptionToken> {
+        self.grace
+            .iter()
+            .filter(|(d, _)| !self.revocations.contains_key(d) && self.map.contains_key(d))
+            .filter(|(d, g)| self.pair_state.get(d).map(|s| s.pair_id) == Some(g.pair_id))
+            .map(|(d, g)| (*d, g.token.clone()))
+            .collect()
     }
 
     pub fn pair_id(&self, id: &DeviceId) -> Option<PairId> {
@@ -511,6 +573,84 @@ impl PeerStore {
         Ok(candidate_pair_id)
     }
 
+    /// Host-side commit: [`Self::commit_handshake`] plus the one-use grace token.
+    ///
+    /// The host commits a rotation before it tells the phone, and nothing can make
+    /// that pair of writes atomic across two machines. A phone that never learns
+    /// the new token - the link drops, the app is suspended as the screen locks,
+    /// its Keychain refuses the write - keeps the one it had. Without a grace token
+    /// its next reconnect was refused (`WrongPin`) until the user re-paired.
+    ///
+    /// - `CurrentToken`: the token that authenticated this resume becomes the grace
+    ///   token, BEFORE the rotation is written, so it covers this very rotation.
+    /// - `PreviousToken`: the grace token is used up AFTER the rotation lands. A
+    ///   crash between the two leaves it usable once more rather than locking the
+    ///   phone out; a phone that misses two rotations in a row must re-pair.
+    /// - A fresh or manual pair starts a new generation and drops any grace token.
+    ///
+    /// Grace writes are best-effort: losing one only restores the old behaviour.
+    /// Every grace token is bound to its pair generation and filtered by revocation
+    /// in [`Self::grace_tokens`], so a lost cleanup can never admit anyone.
+    pub fn commit_host_handshake(
+        &mut self,
+        peer: DeviceId,
+        commit: HandshakeCommit,
+        resumed_with: ResumedWith,
+    ) -> std::io::Result<PairId> {
+        if !commit.resumed {
+            let pair_id = self.commit_handshake(peer, commit)?;
+            self.drop_grace(&peer);
+            return Ok(pair_id);
+        }
+        match resumed_with {
+            ResumedWith::CurrentToken => {
+                // Only stage a grace token for a commit that can still succeed; on
+                // a refused commit, let `commit_handshake` report why.
+                let can_commit = self.revocation_marker(&peer).is_none()
+                    && self.token_is_unchanged(&peer, commit.observed_token.as_ref());
+                if let (true, Some(authenticated)) = (can_commit, commit.observed_token.clone()) {
+                    let pair_id = self
+                        .pair_state
+                        .get(&peer)
+                        .map(|s| s.pair_id)
+                        .unwrap_or(commit.candidate_pair_id);
+                    self.set_grace(
+                        peer,
+                        GraceToken {
+                            pair_id,
+                            token: authenticated,
+                        },
+                    );
+                }
+                self.commit_handshake(peer, commit)
+            }
+            ResumedWith::PreviousToken => {
+                let pair_id = self.commit_handshake(peer, commit)?;
+                self.drop_grace(&peer);
+                Ok(pair_id)
+            }
+        }
+    }
+
+    /// Install a grace token and persist it, best-effort: a lost write only means
+    /// the next missed rotation still needs a re-pair.
+    fn set_grace(&mut self, peer: DeviceId, grace: GraceToken) {
+        self.grace.insert(peer, grace);
+        if let Err(e) = self.persist_grace() {
+            tracing::warn!(peer = %peer, error = %e, "could not save the previous reconnect token; a phone that misses this rotation will have to re-pair");
+        }
+    }
+
+    /// Drop a peer's grace token, if any. Only writes when something changed, so
+    /// a phone - which never holds grace tokens - never creates the record.
+    fn drop_grace(&mut self, peer: &DeviceId) {
+        if self.grace.remove(peer).is_some() {
+            if let Err(e) = self.persist_grace() {
+                tracing::warn!(peer = %peer, error = %e, "could not remove a used reconnect token; it stays bound to its pair generation and revocation");
+            }
+        }
+    }
+
     fn restore_pair_state(&mut self, peer: DeviceId, previous: Option<PairState>) {
         if let Some(previous) = previous {
             self.pair_state.insert(peer, previous);
@@ -564,6 +704,9 @@ impl PeerStore {
         }
         drop(removed);
         drop(removed_state);
+        // After the tombstone, like the token: `grace_tokens` already filters a
+        // revoked peer, so this is tidiness, not the protection.
+        self.drop_grace(peer);
         if self.last_connected == Some(*peer) {
             let _ = self.store.remove(LAST_HOST_RECORD);
             self.last_connected = None;
@@ -589,6 +732,8 @@ impl PeerStore {
         // Token is already gone, which is the secure direction. Report any
         // cleanup error without restoring a usable credential.
         self.persist_pair_state()?;
+        // Without a current token `grace_tokens` ignores it anyway.
+        self.drop_grace(peer);
         drop(removed);
         if self.last_connected == Some(*peer) {
             self.store.remove(LAST_HOST_RECORD)?;
@@ -621,6 +766,12 @@ impl PeerStore {
             return Err(e);
         }
         self.persist_pair_state()?;
+        if !self.grace.is_empty() {
+            self.grace.clear();
+            if let Err(e) = self.persist_grace() {
+                tracing::warn!(error = %e, "could not remove previous reconnect tokens; with no current token they cannot authenticate");
+            }
+        }
         drop(old);
         drop(old_state);
         if self.last_connected.is_some() {
@@ -684,6 +835,22 @@ impl PeerStore {
         let result = self
             .store
             .write(REVOCATIONS_RECORD, &bytes, Durability::Required);
+        bytes.zeroize();
+        result
+    }
+
+    fn persist_grace(&self) -> std::io::Result<()> {
+        if self.grace.is_empty() {
+            return self.store.remove(GRACE_RECORD);
+        }
+        let mut bytes = postcard::to_allocvec(&self.grace)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        // Grace tokens only ever add availability: a lost write restores the old
+        // "missed rotation means re-pair" behaviour, and a stale one is filtered by
+        // generation and revocation. BestEffort, like a rotation.
+        let result = self
+            .store
+            .write(GRACE_RECORD, &bytes, Durability::BestEffort);
         bytes.zeroize();
         result
     }
@@ -1148,5 +1315,391 @@ mod tests {
         let reloaded = PeerStore::load(dir.path()).unwrap();
         assert!(reloaded.token(&device).is_none());
         assert!(reloaded.pair_id(&device).is_none());
+    }
+
+    // ── Grace token: the previous token, one more reconnect ─────────────
+
+    fn commit_host_resume(
+        store: &mut PeerStore,
+        device: DeviceId,
+        observed: [u8; 32],
+        next: u8,
+        resumed_with: ResumedWith,
+    ) -> std::io::Result<PairId> {
+        store.commit_host_handshake(
+            device,
+            HandshakeCommit {
+                ticket: None,
+                token: ResumptionToken::from([next; 32]),
+                resumed: true,
+                candidate_pair_id: PairId([next; 16]),
+                candidate_event_key: PairEventKey::from([next.wrapping_add(1); 32]),
+                observed_revocation: store.revocation_marker(&device),
+                observed_token: Some(ResumptionToken::from(observed)),
+            },
+            resumed_with,
+        )
+    }
+
+    fn grace_of(store: &PeerStore, device: DeviceId) -> Option<[u8; 32]> {
+        store.grace_tokens().get(&device).map(|t| *t.as_bytes())
+    }
+
+    fn grace_file(dir: &Path) -> std::path::PathBuf {
+        dir.join(GRACE_RECORD)
+    }
+
+    #[test]
+    fn a_resume_keeps_the_token_it_proved_as_the_one_use_grace() {
+        let dir = tempfile::tempdir().unwrap();
+        let device = DeviceId([0x81; 16]);
+        let mut store = PeerStore::load(dir.path()).unwrap();
+        commit_fresh(&mut store, device, 0x41);
+
+        commit_host_resume(
+            &mut store,
+            device,
+            [0x41; 32],
+            0x42,
+            ResumedWith::CurrentToken,
+        )
+        .unwrap();
+        assert_eq!(store.token(&device).unwrap().as_bytes(), &[0x42; 32]);
+        // The phone holds 0x42 if it heard back, else still 0x41 - both work.
+        assert_eq!(grace_of(&store, device), Some([0x41; 32]));
+    }
+
+    #[test]
+    fn resuming_with_the_previous_token_uses_it_up() {
+        let dir = tempfile::tempdir().unwrap();
+        let device = DeviceId([0x82; 16]);
+        let mut store = PeerStore::load(dir.path()).unwrap();
+        commit_fresh(&mut store, device, 0x41);
+        commit_host_resume(
+            &mut store,
+            device,
+            [0x41; 32],
+            0x42,
+            ResumedWith::CurrentToken,
+        )
+        .unwrap();
+
+        // The phone missed that rotation and came back with 0x41 (grace). The
+        // commit still names the CURRENT token as observed - the CAS guards it.
+        commit_host_resume(
+            &mut store,
+            device,
+            [0x42; 32],
+            0x43,
+            ResumedWith::PreviousToken,
+        )
+        .unwrap();
+        assert_eq!(store.token(&device).unwrap().as_bytes(), &[0x43; 32]);
+        assert_eq!(grace_of(&store, device), None, "a grace token works once");
+        assert!(!grace_file(dir.path()).exists());
+        assert!(PeerStore::load(dir.path())
+            .unwrap()
+            .grace_tokens()
+            .is_empty());
+    }
+
+    #[test]
+    fn the_grace_token_survives_a_host_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let device = DeviceId([0x83; 16]);
+        let mut store = PeerStore::load(dir.path()).unwrap();
+        commit_fresh(&mut store, device, 0x41);
+        commit_host_resume(
+            &mut store,
+            device,
+            [0x41; 32],
+            0x42,
+            ResumedWith::CurrentToken,
+        )
+        .unwrap();
+
+        // The host reloads the store on every connection, so an unsaved grace
+        // token would be worthless.
+        let reloaded = PeerStore::load(dir.path()).unwrap();
+        assert_eq!(grace_of(&reloaded, device), Some([0x41; 32]));
+        assert_eq!(reloaded.token(&device).unwrap().as_bytes(), &[0x42; 32]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_grace_record_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let device = DeviceId([0x84; 16]);
+        let mut store = PeerStore::load(dir.path()).unwrap();
+        commit_fresh(&mut store, device, 0x41);
+        commit_host_resume(
+            &mut store,
+            device,
+            [0x41; 32],
+            0x42,
+            ResumedWith::CurrentToken,
+        )
+        .unwrap();
+        let mode = std::fs::metadata(grace_file(dir.path()))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600, "a grace token is a reconnect credential");
+    }
+
+    #[test]
+    fn revoking_a_peer_drops_its_grace_token() {
+        let dir = tempfile::tempdir().unwrap();
+        let device = DeviceId([0x85; 16]);
+        let mut store = PeerStore::load(dir.path()).unwrap();
+        commit_fresh(&mut store, device, 0x41);
+        commit_host_resume(
+            &mut store,
+            device,
+            [0x41; 32],
+            0x42,
+            ResumedWith::CurrentToken,
+        )
+        .unwrap();
+
+        store.revoke(&device).unwrap();
+        assert!(store.grace_tokens().is_empty());
+        assert!(!grace_file(dir.path()).exists());
+        assert!(PeerStore::load(dir.path())
+            .unwrap()
+            .grace_tokens()
+            .is_empty());
+    }
+
+    #[test]
+    fn a_revoked_peer_has_no_grace_even_if_the_cleanup_was_lost() {
+        let dir = tempfile::tempdir().unwrap();
+        let device = DeviceId([0x86; 16]);
+        let mut store = PeerStore::load(dir.path()).unwrap();
+        commit_fresh(&mut store, device, 0x41);
+        commit_host_resume(
+            &mut store,
+            device,
+            [0x41; 32],
+            0x42,
+            ResumedWith::CurrentToken,
+        )
+        .unwrap();
+        // Keep a copy of the grace record, revoke, then put the record back - as
+        // if the best-effort cleanup never reached the disk.
+        let saved = std::fs::read(grace_file(dir.path())).unwrap();
+        store.revoke(&device).unwrap();
+        std::fs::write(grace_file(dir.path()), saved).unwrap();
+
+        let reloaded = PeerStore::load(dir.path()).unwrap();
+        assert!(
+            reloaded.grace_tokens().is_empty(),
+            "the tombstone, not the cleanup, is what stops a revoked peer"
+        );
+    }
+
+    #[test]
+    fn a_fresh_pair_drops_the_grace_token_of_the_old_generation() {
+        let dir = tempfile::tempdir().unwrap();
+        let device = DeviceId([0x87; 16]);
+        let mut store = PeerStore::load(dir.path()).unwrap();
+        commit_fresh(&mut store, device, 0x41);
+        commit_host_resume(
+            &mut store,
+            device,
+            [0x41; 32],
+            0x42,
+            ResumedWith::CurrentToken,
+        )
+        .unwrap();
+
+        store
+            .commit_host_handshake(
+                device,
+                HandshakeCommit {
+                    ticket: None,
+                    token: ResumptionToken::from([0x51; 32]),
+                    resumed: false,
+                    candidate_pair_id: PairId([0x51; 16]),
+                    candidate_event_key: PairEventKey::from([0x52; 32]),
+                    observed_revocation: None,
+                    observed_token: None,
+                },
+                ResumedWith::CurrentToken,
+            )
+            .unwrap();
+        assert_eq!(grace_of(&store, device), None);
+        assert!(!grace_file(dir.path()).exists());
+    }
+
+    #[test]
+    fn a_grace_token_from_an_older_generation_is_ignored() {
+        let dir = tempfile::tempdir().unwrap();
+        let device = DeviceId([0x88; 16]);
+        let mut store = PeerStore::load(dir.path()).unwrap();
+        commit_fresh(&mut store, device, 0x41);
+        commit_host_resume(
+            &mut store,
+            device,
+            [0x41; 32],
+            0x42,
+            ResumedWith::CurrentToken,
+        )
+        .unwrap();
+        // A re-pair through the plain commit (no grace cleanup at all) installs a
+        // new generation. The record still holds 0x41, bound to the old one.
+        commit_fresh(&mut store, device, 0x61);
+        assert!(grace_file(dir.path()).exists());
+        assert_eq!(grace_of(&store, device), None);
+        assert_eq!(
+            grace_of(&PeerStore::load(dir.path()).unwrap(), device),
+            None
+        );
+    }
+
+    #[test]
+    fn a_corrupt_grace_record_only_removes_the_grace() {
+        let dir = tempfile::tempdir().unwrap();
+        let device = DeviceId([0x89; 16]);
+        let mut store = PeerStore::load(dir.path()).unwrap();
+        commit_fresh(&mut store, device, 0x41);
+        std::fs::write(grace_file(dir.path()), b"\xff\xff\xff\xff not postcard").unwrap();
+
+        let reloaded = PeerStore::load(dir.path()).unwrap();
+        assert!(reloaded.grace_tokens().is_empty());
+        assert_eq!(reloaded.token(&device).unwrap().as_bytes(), &[0x41; 32]);
+    }
+
+    #[test]
+    fn the_phone_path_never_creates_a_grace_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let device = DeviceId([0x8a; 16]);
+        let mut store = PeerStore::load(dir.path()).unwrap();
+        commit_fresh(&mut store, device, 0x41);
+        commit_resume(&mut store, device, Some([0x41; 32]), 0x42).unwrap();
+        store.forget(&device).unwrap();
+        commit_fresh(&mut store, device, 0x43);
+        store.revoke(&device).unwrap();
+        assert!(
+            !grace_file(dir.path()).exists(),
+            "a phone holds no grace tokens and must not write the record"
+        );
+    }
+
+    #[test]
+    fn a_refused_resume_stages_no_grace() {
+        let dir = tempfile::tempdir().unwrap();
+        let device = DeviceId([0x8b; 16]);
+        let mut store = PeerStore::load(dir.path()).unwrap();
+        commit_fresh(&mut store, device, 0x41);
+
+        // Names a token that is not on record (a concurrent resume rotated it).
+        let error = commit_host_resume(
+            &mut store,
+            device,
+            [0x99; 32],
+            0x42,
+            ResumedWith::CurrentToken,
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        assert_eq!(grace_of(&store, device), None);
+        assert!(!grace_file(dir.path()).exists());
+    }
+
+    /// The whole story through the real handshake: a phone misses one rotation,
+    /// heals on its next reconnect, and its old token is then dead for good.
+    #[test]
+    fn a_missed_rotation_heals_once_and_only_once() {
+        use crate::handshake::{
+            ClientHandshake, HandshakeMessage, Outcome, PairingFailure, ServerHandshake,
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let phone = DeviceId([0x8c; 16]);
+        let host = DeviceId([0x8d; 16]);
+        let mut store = PeerStore::load(dir.path()).unwrap();
+        commit_fresh(&mut store, phone, 0x41);
+
+        // One reconnect, exactly as the host runs it: reload, handshake with the
+        // current and previous tokens, commit through the host path. Returns the
+        // phone's next token on success, or the refusal.
+        let reconnect = |store: &mut PeerStore,
+                         phone_token: [u8; 32]|
+         -> Result<([u8; 32], bool), PairingFailure> {
+            *store = PeerStore::load(dir.path()).unwrap();
+            let observed = store.token(&phone);
+            let mut client = ClientHandshake::resume(phone, "phone".into(), phone_token);
+            let mut server = ServerHandshake::new(host, "host".into())
+                .with_resumption_tokens(store.tokens())
+                .with_grace_tokens(store.grace_tokens());
+            let Outcome::Send(challenge) = server.step(client.start()).unwrap() else {
+                panic!("expected challenge");
+            };
+            let Outcome::Send(proof) = client.step(challenge).unwrap() else {
+                panic!("expected proof");
+            };
+            let (session, previous_token) = match server.step(proof).unwrap() {
+                Outcome::Done {
+                    session,
+                    previous_token,
+                    ..
+                } => (session, previous_token),
+                Outcome::Send(HandshakeMessage::PairingFailed { reason }) => return Err(reason),
+                o => panic!("unexpected server outcome {o:?}"),
+            };
+            let host_next = crate::handshake::derive_reconnect_token(&session).unwrap();
+            let pair_material = crate::handshake::derive_pair_material(&session).unwrap();
+            store
+                .commit_host_handshake(
+                    phone,
+                    HandshakeCommit {
+                        ticket: None,
+                        token: host_next,
+                        resumed: true,
+                        candidate_pair_id: pair_material.0,
+                        candidate_event_key: pair_material.1,
+                        observed_revocation: store.revocation_marker(&phone),
+                        observed_token: observed,
+                    },
+                    if previous_token {
+                        ResumedWith::PreviousToken
+                    } else {
+                        ResumedWith::CurrentToken
+                    },
+                )
+                .unwrap();
+            let ok = HandshakeMessage::PairingOk {
+                device_id: host.0,
+                display_name: "host".into(),
+            };
+            let client_session = match client.step(ok).unwrap() {
+                Outcome::Done { session, .. } => session,
+                o => panic!("expected client Done, got {o:?}"),
+            };
+            let phone_next = crate::handshake::derive_reconnect_token(&client_session).unwrap();
+            Ok((*phone_next.as_bytes(), previous_token))
+        };
+
+        // 1. An ordinary reconnect - but the phone never saves its new token.
+        let (_lost, previous) = reconnect(&mut store, [0x41; 32]).unwrap();
+        assert!(!previous);
+
+        // 2. Before the fix this was WrongPin until a re-pair. Now it heals, and
+        //    this time the phone keeps what it is given.
+        let (healed, previous) = reconnect(&mut store, [0x41; 32]).unwrap();
+        assert!(previous, "healed by the previous token");
+
+        // 3. The old token is now spent - a replay of it is refused.
+        assert_eq!(
+            reconnect(&mut store, [0x41; 32]).unwrap_err(),
+            PairingFailure::WrongPin
+        );
+
+        // 4. The healed credential keeps working the ordinary way.
+        let (_next, previous) = reconnect(&mut store, healed).unwrap();
+        assert!(!previous);
     }
 }

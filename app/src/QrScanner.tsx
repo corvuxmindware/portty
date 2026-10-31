@@ -1,6 +1,7 @@
 import { createSignal, onCleanup, onMount, Show } from "solid-js";
 import jsQR from "jsqr";
 import { Icon } from "./Icon";
+import { cameraErrorMessage, detectPlatform, NO_CAMERA_MESSAGE } from "./lib/friendlyError";
 
 /**
  * Camera-based QR scanner for the pairing flow. Lifted from Corvux's
@@ -22,8 +23,19 @@ import { Icon } from "./Icon";
  * grant (declared in AndroidManifest.xml). `playsinline` keeps the preview from
  * going fullscreen.
  *
- * The PIN is intentionally NOT in the QR - it stays manual as the out-of-band
- * MitM check. Scanning only fills the ticket (here, the bare NodeId).
+ * ## iOS WKWebView
+ * The camera runs and its frames can be read, but a `<video>` showing the stream
+ * stays black - plain or styled, on an iPhone 16 Pro with iOS 27 (Tauri 2.12).
+ * So on iOS the preview is a canvas, drawn from the same frames the scanner
+ * reads. Android keeps the `<video>`, which the compositor animates smoothly.
+ *
+ * Scanning only fills the setup-code field; the person still checks the
+ * comparison code and confirms it on the computer.
+ *
+ * ## When the camera won't start
+ * `onError` gets plain words for the reason (denied, missing, busy - see
+ * `cameraErrorMessage`), each offering to paste the code from `portty pair`
+ * instead, never the browser's own "Permission denied".
  */
 
 type FocusCapabilities = MediaTrackCapabilities & { focusMode?: string[]; torch?: boolean };
@@ -36,6 +48,9 @@ export function QrScanner(props: {
 }) {
   let video!: HTMLVideoElement;
   let canvas!: HTMLCanvasElement;
+  /** iOS only: the visible preview, see "iOS WKWebView" above. */
+  let preview: HTMLCanvasElement | undefined;
+  const canvasPreview = detectPlatform() === "ios";
   const [status, setStatus] = createSignal<"starting" | "scanning">("starting");
   const [cameras, setCameras] = createSignal<MediaDeviceInfo[]>([]);
   const [camIndex, setCamIndex] = createSignal(0);
@@ -143,6 +158,20 @@ export function QrScanner(props: {
     return bestIdx;
   }
 
+  /** Paint the frame into the preview with the same crop as `object-fit: cover`. */
+  function drawPreview(target: HTMLCanvasElement, w: number, h: number) {
+    const cw = Math.round(target.clientWidth * window.devicePixelRatio);
+    const ch = Math.round(target.clientHeight * window.devicePixelRatio);
+    const ctx = target.getContext("2d");
+    if (!ctx || cw === 0 || ch === 0) return;
+    if (target.width !== cw) target.width = cw;
+    if (target.height !== ch) target.height = ch;
+    const scale = Math.max(cw / w, ch / h);
+    const sw = cw / scale;
+    const sh = ch / scale;
+    ctx.drawImage(video, (w - sw) / 2, (h - sh) / 2, sw, sh, 0, 0, cw, ch);
+  }
+
   function startLoop() {
     const ctx = canvas.getContext("2d", { willReadFrequently: true });
     const tick = () => {
@@ -151,6 +180,7 @@ export function QrScanner(props: {
         const w = video.videoWidth;
         const h = video.videoHeight;
         if (w > 0 && h > 0) {
+          if (preview) drawPreview(preview, w, h);
           canvas.width = w;
           canvas.height = h;
           ctx.drawImage(video, 0, 0, w, h);
@@ -172,15 +202,14 @@ export function QrScanner(props: {
 
   onMount(async () => {
     if (!navigator.mediaDevices?.getUserMedia) {
-      props.onError("Camera isn't available on this device - paste the code instead.");
+      props.onError(NO_CAMERA_MESSAGE);
       return;
     }
     try {
       await openCamera();
     } catch (e) {
-      const msg = e instanceof Error ? e.message : String(e);
       console.warn("qr-scanner: getUserMedia rejected", e);
-      props.onError(`Camera access failed: ${msg}`);
+      props.onError(cameraErrorMessage(e));
       return;
     }
     try {
@@ -225,6 +254,9 @@ export function QrScanner(props: {
         }}
       >
         <video ref={video} class="h-full w-full object-cover" />
+        <Show when={canvasPreview}>
+          <canvas ref={preview} class="absolute inset-0 h-full w-full" />
+        </Show>
         <canvas ref={canvas} class="hidden" />
         {/* Aiming frame */}
         <div class="pointer-events-none absolute inset-5 rounded-xl border-2 border-lime-400/70" />

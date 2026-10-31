@@ -138,9 +138,10 @@ pub fn open_wake_blob(key: &[u8; 32], blob: &[u8]) -> Option<DeviceId> {
 
 /// Directories the native layer might have used for the bridge files, most
 /// likely first. Tauri's `app_data_dir` maps to Application Support on iOS and
-/// the internal files dir on Android, but the exact mapping is a Tauri
-/// implementation detail - scanning the small candidate set makes the pickup
-/// robust to it. All candidates are inside the app sandbox.
+/// the app's root data dir (`Context.getDataDir()`, not `filesDir`) on Android,
+/// but the exact mapping is a Tauri implementation detail - scanning the small
+/// candidate set makes the pickup robust to it. All candidates are inside the
+/// app sandbox.
 pub fn bridge_dirs(app: &tauri::AppHandle) -> Vec<PathBuf> {
     use tauri::Manager;
     let mut dirs = Vec::new();

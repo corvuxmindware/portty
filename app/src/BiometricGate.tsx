@@ -41,6 +41,13 @@ import {
   mustGate,
   promptBiometric,
 } from "./lib/biometric";
+import { systemUi } from "./lib/systemUi";
+
+/** Fired on `window` after the lock is passed on a return to the app. The
+ *  prompt pauses the app underneath, so `lockedForMs` is time the link may have
+ *  sat idle unnoticed - App re-checks it (lib/linkGuard.ts). */
+export const UNLOCKED_EVENT = "portty:unlocked";
+export type UnlockedDetail = { lockedForMs: number };
 
 type Phase = "checking" | "locked" | "unlocked";
 
@@ -80,17 +87,26 @@ export const BiometricGate: ParentComponent = (props) => {
       !bootstrapped() || phase() === "locked";
   });
 
+  // When the lock went up on a return to the app (not at cold start).
+  let lockedAt: number | null = null;
+
   const runPrompt = async () => {
     if (attempting) return;
     attempting = true;
     setError("");
     setPhase("locked");
+    if (bootstrapped() && lockedAt === null) lockedAt = Date.now();
     const ok = await promptBiometric("Authenticate to access your terminals");
     attempting = false;
     if (ok) {
       setPhase("unlocked");
       setCovered(false);
       setBootstrapped(true);
+      if (lockedAt !== null) {
+        const detail: UnlockedDetail = { lockedForMs: Date.now() - lockedAt };
+        lockedAt = null;
+        window.dispatchEvent(new CustomEvent(UNLOCKED_EVENT, { detail }));
+      }
     } else {
       setError("Authentication canceled. Tap to try again.");
     }
@@ -116,9 +132,11 @@ export const BiometricGate: ParentComponent = (props) => {
   // closes. Remembering the preceding hidden state lets us consume that edge
   // while `attempting` is true instead of immediately prompting again.
   let wasHidden = document.visibilityState === "hidden";
+  let hiddenAt = Date.now();
   const onVisibility = () => {
     if (document.visibilityState === "hidden") {
       wasHidden = true;
+      hiddenAt = Date.now();
       // Raise the privacy cover BEFORE the OS snapshots the app switcher, so the
       // thumbnail never shows the terminal, agent chat, or a pending approval.
       // Best-effort in the webview (iOS/Android may snapshot before this fires -
@@ -131,6 +149,13 @@ export const BiometricGate: ParentComponent = (props) => {
     wasHidden = false;
     if (attempting) return;
     if (phase() === "locked") return; // already showing the lock screen
+    // Back from the file picker or Save dialog the app itself just opened: no
+    // prompt, which would pause the very transfer the user asked for
+    // (lib/systemUi.ts). A long stay there re-locks as usual.
+    if (bootstrapped() && !systemUi.relockOnReturn(hiddenAt)) {
+      setCovered(false);
+      return;
+    }
     // Re-read enforcement on the resume edge: the pref may have been turned on
     // (or a credential enrolled) while this instance was already running. The
     // privacy cover stays up across the await so the terminal is never briefly
