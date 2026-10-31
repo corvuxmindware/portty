@@ -1,26 +1,39 @@
 package org.example.portty
 
 import android.Manifest
-import android.content.Context
+import android.content.ComponentName
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.content.res.Configuration
+import android.graphics.Color
 import android.os.Build
 import android.os.Bundle
+import android.os.Process
 import android.util.Log
 import android.view.WindowManager
 import android.webkit.WebView
 import androidx.activity.OnBackPressedCallback
+import androidx.activity.SystemBarStyle
 import androidx.activity.enableEdgeToEdge
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
 import com.google.firebase.FirebaseApp
+import kotlin.system.exitProcess
 
 class MainActivity : TauriActivity() {
   /** The wry WebView, captured in onWebViewCreate; used by the back handler. */
   private var porttyWebView: WebView? = null
 
   override fun onCreate(savedInstanceState: Bundle?) {
-    enableEdgeToEdge()
+    // Portty's UI is always black, so the status- and navigation-bar icons must
+    // stay light whatever the phone's system theme. The default styles follow
+    // the system theme: in light mode they draw dark icons that vanish on the
+    // black UI, and add a light scrim behind 3-button navigation. dark() keeps
+    // the icons light and the scrim off.
+    enableEdgeToEdge(
+      statusBarStyle = SystemBarStyle.dark(Color.TRANSPARENT),
+      navigationBarStyle = SystemBarStyle.dark(Color.TRANSPARENT),
+    )
     // Block the Recents/app-switcher thumbnail (and screenshots) from capturing
     // the terminal or a pending approval. FLAG_SECURE is the guaranteed Android
     // layer; the webview privacy cover in BiometricGate is best-effort on top.
@@ -28,9 +41,21 @@ class MainActivity : TauriActivity() {
       WindowManager.LayoutParams.FLAG_SECURE,
       WindowManager.LayoutParams.FLAG_SECURE,
     )
-    // Rust setup now opens the Keystore-backed Portty credential store, so the
-    // application context must exist before Tauri enters the Rust mobile entry.
-    initNdkContext()
+    // Tauri's runtime starts once per process and stays bound to the first
+    // MainActivity. A second one in the same process cannot work (see
+    // restartProcess), so start the app over instead of running half-broken.
+    if (tauriStartedInProcess) {
+      // The restart drops this launch's intent; keep a doorbell tap it carried.
+      storeWakeFromIntent(intent)
+      restartProcess() // ends this process; never returns
+    }
+    tauriStartedInProcess = true
+    // tao (since 0.37, shipped with Tauri 2.12) initializes the global
+    // ndk_context itself during WryActivity.onCreate, before the Rust mobile
+    // entry runs - so the initNdkContext() shim this app used with tao 0.35 is
+    // gone. Initializing here as well would abort the process: ndk-context
+    // asserts it is initialized exactly once, and a panic inside the JNI
+    // boundary cannot unwind.
     super.onCreate(savedInstanceState)
     // Cold start from a push-notification tap: for notification+data FCM
     // messages delivered in the background, Android posts the notification
@@ -75,6 +100,21 @@ class MainActivity : TauriActivity() {
    *  ask the web UI to handle the gesture. */
   override fun onWebViewCreate(webView: WebView) {
     porttyWebView = webView
+  }
+
+  /**
+   * fontScale is in the manifest's configChanges, so a system font-size change
+   * no longer re-creates this Activity - and a live WebView reads the font scale
+   * only when it is created (Chromium's AwSettings sets text zoom to
+   * fontScale x 100). Apply a changed scale the same way so the new size shows
+   * at once. Only on a real change: setTextZoom also stops WebView from
+   * tracking the scale by itself.
+   */
+  override fun onConfigurationChanged(newConfig: Configuration) {
+    super.onConfigurationChanged(newConfig)
+    val settings = porttyWebView?.settings ?: return
+    val textZoom = (newConfig.fontScale * 100).toInt()
+    if (settings.textZoom != textZoom) settings.textZoom = textZoom
   }
 
   override fun onNewIntent(intent: Intent) {
@@ -144,33 +184,44 @@ class MainActivity : TauriActivity() {
   }
 
   /**
-   * Initialize the global `ndk_context` (JavaVM + Application context) BEFORE
-   * Tauri starts Rust setup. Tauri V2's Android
-   * flow never runs tao's `create()` - which would normally set it - so without
-   * this, iroh's network monitor panics on the first `build_endpoint` with
-   * "android context was not initialized". Implemented in Rust via the JNI symbol
-   * `Java_com_corvuxmindware_portty_MainActivity_nativeInitNdkContext`
-   * (see `src/android_context.rs`). `System.loadLibrary` is idempotent, so calling
-   * it here guarantees the symbol resolves regardless of when wry first loads it.
-   * A failure is logged here; secure-store setup then fails closed instead of
-   * silently returning to plaintext credential files.
+   * Replace this process with a fresh one. Used when a MainActivity is created
+   * in a process whose Tauri runtime already belongs to an earlier MainActivity:
+   * a configuration change the manifest does not list, or a launch that clears
+   * the task (`am start --activity-clear-task`, some launchers and automation
+   * apps). Tauri 2.11.5 cannot move its runtime to a new Activity:
+   *
+   *  - PluginManager and every native plugin keep the FIRST Activity forever
+   *    (an upstream TODO), so biometric unlock, file pickers and permission
+   *    prompts all fail - the app lock could never be passed;
+   *  - an Activity with a new id gets no WebView at all (a blank screen), and
+   *    once the old Activity is destroyed Tauri closes its only window and
+   *    exits the process anyway.
+   *
+   * The restart intent reopens the app when the user is looking at it. From the
+   * background Android 10+ blocks it, and the task is simply rebuilt in a new
+   * process the next time the app is opened.
    */
-  private fun initNdkContext() {
+  private fun restartProcess(): Nothing {
+    Log.w("Portty", "MainActivity re-created in a running process; restarting the app")
     try {
-      System.loadLibrary("portty_app_lib")
-      check(nativeInitNdkContext(applicationContext)) {
-        "native ndk_context initialization returned failure"
-      }
-      Log.i("Portty", "ndk_context initialized at MainActivity.onCreate")
+      startActivity(Intent.makeRestartActivityTask(ComponentName(this, MainActivity::class.java)))
     } catch (ex: Throwable) {
-      Log.e("Portty", "ndk_context init failed: ${ex.message}", ex)
-      throw ex
+      Log.e("Portty", "could not schedule the app restart: ${ex.message}", ex)
     }
+    // SIGKILL, as Android's own crash handler does, so no exit hooks run while
+    // Rust and WebView threads are live. The activity started above survives:
+    // Android launches a not-yet-run activity in a new process if its old one dies.
+    Process.killProcess(Process.myPid())
+    exitProcess(10)
   }
-
-  private external fun nativeInitNdkContext(context: Context): Boolean
 
   private companion object {
     const val REQUEST_POST_NOTIFICATIONS = 4201
+
+    /**
+     * Whether a MainActivity already started Tauri in this process. Only used
+     * on the main thread; a new process starts with it false.
+     */
+    var tauriStartedInProcess = false
   }
 }

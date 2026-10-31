@@ -1463,8 +1463,12 @@ fn login_shell_command() -> CommandBuilder {
 /// reintroduce it by forgetting.
 ///
 /// Canonicalized to match the agent spawn, and because `workspace_dir()` falls
-/// back to `"."`. `None` means "leave portable_pty's default alone": the workspace
-/// is unresolvable (launch dir deleted under us), and a terminal that opens in the
+/// back to `"."`. On Windows that is the verbatim `\\?\C:\...` form, which
+/// `spawn_shell` turns back into a plain spelling before the shell sees it (see
+/// `workspace::plain_spelling`).
+///
+/// `None` means "leave portable_pty's default alone": the workspace is
+/// unresolvable (launch dir deleted under us), and a terminal that opens in the
 /// wrong place still beats refusing to open one - `cmd.cwd()` with a path that no
 /// longer exists fails the spawn outright.
 fn default_shell_cwd() -> Option<PathBuf> {
@@ -2124,9 +2128,12 @@ async fn probe_agent_sessions(
         closed: closed_tx,
         debug: None,
     };
-    // The spelling the AGENT will recognise, which is not always the resolver's
-    // (see `agent_facing_path`). This is what its own `cwd` filter matches on.
-    let probe_cwd = agent_facing_path(&cwd);
+    // The spelling the AGENT will recognise, which is not always the resolver's.
+    // `resolve_within` canonicalizes, which on Windows yields the verbatim
+    // `\\?\C:\w\app`, while adapters record and match the process working
+    // directory `C:\w\app` - hand them the verbatim one and their own `cwd`
+    // filter matches nothing, so the listing silently comes back empty.
+    let probe_cwd = crate::workspace::plain_spelling(&cwd);
     let probe = acp::Client.builder().name("portty-host").connect_with(
         agent,
         async move |cx: acp::ConnectionTo<acp::Agent>| {
@@ -2208,39 +2215,6 @@ fn first_line(text: &str) -> &str {
         end -= 1;
     }
     &line[..end]
-}
-
-/// The spelling of `path` to hand an agent.
-///
-/// `workspace::resolve_within` canonicalizes, and on Windows that yields the
-/// verbatim form (`\\?\C:\w\app`). Adapters record and match a process working
-/// directory (`C:\w\app`), so handing them the verbatim spelling means their own
-/// `cwd` filter matches nothing and the whole listing silently comes back empty.
-/// Unix has no such form and this is the identity there.
-/// Only `VerbatimDisk` is unwrapped. A `VerbatimUNC` path has no plain spelling
-/// that means the same thing, so it is left exactly as it is rather than
-/// rewritten into something that might point somewhere else.
-fn agent_facing_path(path: &std::path::Path) -> PathBuf {
-    #[cfg(windows)]
-    {
-        use std::ffi::OsString;
-        use std::os::windows::ffi::{OsStrExt as _, OsStringExt as _};
-        use std::path::{Component, Prefix};
-
-        const VERBATIM: &[u16] = &[b'\\' as u16, b'\\' as u16, b'?' as u16, b'\\' as u16];
-        if let Some(Component::Prefix(prefix)) = path.components().next() {
-            if matches!(prefix.kind(), Prefix::VerbatimDisk(_)) {
-                // Through UTF-16, not `to_string_lossy`: a Windows path need not
-                // be valid Unicode, and the lossy form would hand the agent a
-                // path with U+FFFD where its real bytes used to be.
-                let wide: Vec<u16> = path.as_os_str().encode_wide().collect();
-                if wide.starts_with(VERBATIM) {
-                    return PathBuf::from(OsString::from_wide(&wide[VERBATIM.len()..]));
-                }
-            }
-        }
-    }
-    path.to_path_buf()
 }
 
 /// `Path::canonicalize`, with any failure meaning "no answer".
@@ -3270,8 +3244,16 @@ impl SessionManager {
         cmd.env("PORTTY_RELAY", "1");
         // `None` means "wherever the workspace is", NOT "wherever portable_pty
         // feels like" - see `default_shell_cwd`.
+        //
+        // The directories that matter here are canonical - the default above and
+        // anything the phone picked through `resolve_within` - which on Windows
+        // means the verbatim `\\?\C:\...`. portable-pty hands it to Windows
+        // exactly as given (unlike `std::process::Command`, which strips the
+        // prefix), and cmd.exe cannot start there: it prints "UNC paths are not
+        // supported" and opens in C:\Windows instead. So the shell gets the
+        // plain spelling of the same directory.
         if let Some(cwd) = cwd.or_else(default_shell_cwd) {
-            cmd.cwd(cwd);
+            cmd.cwd(crate::workspace::plain_spelling(&cwd));
         }
         let child = slave
             .spawn_command(cmd)
@@ -6790,6 +6772,55 @@ mod tests {
         assert_eq!(default_shell_cwd(), Some(expected));
     }
 
+    /// The Windows half of the directory fix, end to end through ConPTY.
+    ///
+    /// Every directory a shell is given is canonical - the default above and any
+    /// folder the phone picks through `resolve_within` - and on Windows that is
+    /// the verbatim `\\?\C:\...` form. cmd.exe printed "UNC paths are not
+    /// supported. Defaulting to Windows directory." and every phone terminal
+    /// opened in C:\Windows. Asking the shell where it is catches that; the value
+    /// test above cannot, because the default directory itself was always right.
+    ///
+    /// A temp directory rather than the workspace: its short path cannot wrap in
+    /// the terminal, and the bug never depended on which directory it was.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn a_windows_shell_opens_in_the_canonical_directory_it_was_given() {
+        use std::time::Duration;
+        let dir = tempfile::tempdir().unwrap();
+        let canonical = dir.path().canonicalize().unwrap();
+        let want = crate::workspace::plain_spelling(&canonical)
+            .to_string_lossy()
+            .into_owned();
+
+        let mgr = SessionManager::new();
+        let id = mgr
+            .spawn_shell(Some(canonical), Some("cwd-probe".into()))
+            .await
+            .unwrap();
+        let session = mgr.get(id).await.unwrap();
+        // `cd` with no argument is cmd.exe's `pwd`; the prompt names it too.
+        session.write_input(b"cd\r\n").unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        let mut reported = false;
+        let mut text = String::new();
+        while tokio::time::Instant::now() < deadline {
+            text = String::from_utf8_lossy(&session.scrollback_snapshot()).into_owned();
+            if text.contains(&want) {
+                reported = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        // Kill BEFORE asserting, as the unix probe explains: a panic with the
+        // session alive leaves its PTY reader running and hangs the test binary.
+        mgr.kill(id).await;
+        assert!(
+            reported && !text.contains("UNC paths are not supported"),
+            "the shell must open in {want:?}, not C:\\Windows; scrollback: {text:?}"
+        );
+    }
+
     #[tokio::test]
     async fn session_cap_rejects_beyond_limit() {
         let mgr = SessionManager::new_with_limits(DEFAULT_SCROLLBACK_BYTES, 2);
@@ -7775,6 +7806,74 @@ mod tests {
             result.is_ok(),
             "a bare npm-style launcher must spawn, not fail with \"program not found\": {:?}",
             result.err()
+        );
+    }
+
+    /// ...and that launcher runs in the WORKSPACE, not in C:\Windows.
+    ///
+    /// `sandboxed_acp_path` canonicalizes the directory for its containment
+    /// check, which on Windows makes it verbatim (`\\?\C:\...`), and a `.cmd`
+    /// runs through cmd.exe, which cannot start in such a directory - it says
+    /// "UNC paths are not supported" and falls back to C:\Windows. That is
+    /// exactly what happened to every phone SHELL (portable-pty hands the
+    /// directory to Windows as given). Agent commands escape it only because
+    /// `std::process::Command` strips the prefix itself when it safely can; this
+    /// pins that, so moving these commands onto another spawn path cannot
+    /// quietly reintroduce it. The test above only proves the launcher starts;
+    /// this one asks it where it is.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn acp_terminal_commands_run_in_the_workspace_directory() {
+        use std::time::Duration;
+        let workspace = tempfile::tempdir().unwrap();
+        let bin = tempfile::tempdir().unwrap();
+        let launcher = bin.path().join("portty-cwd-probe.cmd");
+        std::fs::write(&launcher, b"@echo off\r\necho cwd=%CD%\r\n").unwrap();
+
+        // A full path, so there is no PATH lookup - and no process-wide PATH
+        // edit for a parallel test to trip over.
+        let request: CreateTerminalRequest = serde_json::from_value(serde_json::json!({
+            "sessionId": "probe",
+            "command": launcher.to_string_lossy(),
+        }))
+        .expect("a minimal terminal/create request decodes");
+        let terminals = AcpTerminals::new(workspace.path().to_path_buf());
+        let terminal_id = terminals
+            .create(request)
+            .expect("the launcher spawns")
+            .terminal_id
+            .to_string();
+        let ids = serde_json::json!({ "sessionId": "probe", "terminalId": terminal_id });
+        let exited = terminals.wait(serde_json::from_value(ids.clone()).unwrap());
+        tokio::time::timeout(Duration::from_secs(30), exited)
+            .await
+            .expect("the launcher exits")
+            .expect("its exit is reported");
+
+        let workspace_dir = workspace.path().canonicalize().unwrap();
+        let want = format!(
+            "cwd={}",
+            crate::workspace::plain_spelling(&workspace_dir).display()
+        );
+        // Output is captured by separate tasks, which can finish just after exit.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        let output = loop {
+            let output = terminals
+                .output(serde_json::from_value(ids.clone()).unwrap())
+                .unwrap()
+                .output;
+            if output.contains(&want) || tokio::time::Instant::now() >= deadline {
+                break output;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        };
+        assert_eq!(
+            output
+                .lines()
+                .map(str::trim)
+                .find(|l| l.starts_with("cwd=")),
+            Some(want.as_str()),
+            "the command must run in the workspace; it printed {output:?}"
         );
     }
 }

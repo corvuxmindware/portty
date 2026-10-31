@@ -227,7 +227,7 @@ where
             // console that confirms the comparison code, which is the ONLY
             // approval channel a daemonised host has - it owns no terminal to
             // prompt on. Returning would leave such a host unable to pair at all.
-            return serve_pairing_console(rd, wr, p).await;
+            return serve_pairing_console(rd, wr, p.confirm().clone()).await;
         }
         RelayToHost::Ping => {
             // Readiness probe: answer and close. Deliberately touches nothing -
@@ -423,44 +423,62 @@ where
 async fn serve_pairing_console<S>(
     mut rd: tokio::io::ReadHalf<S>,
     mut wr: tokio::io::WriteHalf<S>,
-    pairing: std::sync::Arc<crate::iroh_serve::PairingReopen>,
+    confirm: crate::pair_confirm::PairConfirm,
 ) -> crate::error::HostResult<()>
 where
     S: AsyncRead + AsyncWrite + Send + 'static,
 {
-    let (_console, mut requests) = pairing.confirm().attach();
+    let (_console, mut requests) = confirm.attach();
     info!("`portty pair` attached as the pairing-confirmation console");
 
     // One `portty pair` run confirms exactly one pairing, so this is a single
     // decision rather than a loop: a successful pair consumes the enrollment
     // window anyway, and leaving a stale console attached would let a later
     // unrelated pairing be approved by whoever still had this terminal open.
-    if let Some(request) = requests.recv().await {
+    //
+    // Until it is asked, the CLI sends nothing, so anything readable meanwhile -
+    // EOF above all - means it has gone (Ctrl-C, a closed window). Detach then,
+    // not when the next request finds out: a dead console used to stay attached
+    // and refuse the next pairing straight away, while the live `portty pair`
+    // the user had started since was still waiting for its `y`.
+    let request = tokio::select! {
+        request = requests.recv() => request,
+        () = cli_hung_up(&mut rd) => None,
+    };
+    if let Some(request) = request {
         let ask = HostToRelay::PairingConfirmRequest {
             device_name: request.display_name.clone(),
             code: request.code.clone(),
         };
         let bytes = postcard::to_allocvec(&ask)
             .map_err(|e| crate::error::HostError::Serialization(e.to_string()))?;
-        // Read exactly one answer. Anything else - a failed write, a wrong
-        // variant, a decode failure, EOF - is a refusal, never an approval.
-        let accept = if write_framed(&mut wr, &bytes).await.is_err() {
-            false
-        } else {
-            match read_framed(&mut rd).await {
-                Ok(frame) => matches!(
+        // Read exactly one answer. A console that cannot be asked or never
+        // answers is absent, not a "no": dropping the request unanswered leaves
+        // the decision to any other console, and with none left the broker
+        // denies. Only an explicit `PairingConfirmResponse { accept: true }`
+        // approves; any other frame is a refusal.
+        if write_framed(&mut wr, &bytes).await.is_ok() {
+            if let Ok(frame) = read_framed(&mut rd).await {
+                let accept = matches!(
                     postcard::from_bytes::<RelayToHost>(&frame),
                     Ok(RelayToHost::PairingConfirmResponse { accept: true })
-                ),
-                Err(_) => false,
+                );
+                request.answer(accept).await;
             }
-        };
-        request.answer(accept).await;
+        }
     }
 
     let _ = wr.shutdown().await;
     info!("`portty pair` console detached");
     Ok(())
+}
+
+/// Resolve once the `portty pair` CLI can no longer be asked: EOF, a read
+/// error, or bytes it should not be sending before it is asked. Reading is
+/// cancel-safe, so losing a `select!` to a real request costs nothing.
+async fn cli_hung_up<R: AsyncRead + Unpin>(rd: &mut R) {
+    let mut byte = [0u8; 1];
+    let _ = rd.read(&mut byte).await;
 }
 
 /// Drive one `portty agent` chat connection: bind to a live agent session (or
@@ -724,7 +742,117 @@ pub(crate) async fn write_framed<W: AsyncWrite + Unpin>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::pair_confirm::PairConfirm;
     use portty_protocol::AgentEvent;
+    use portty_transport::DeviceId;
+
+    /// A `portty pair` console served over an in-memory pipe. The returned
+    /// stream is the CLI's end; dropping it is the CLI going away.
+    fn spawn_pair_console(
+        confirm: &PairConfirm,
+    ) -> (
+        tokio::io::DuplexStream,
+        tokio::task::JoinHandle<crate::error::HostResult<()>>,
+    ) {
+        let (cli, host) = tokio::io::duplex(64 * 1024);
+        let (rd, wr) = tokio::io::split(host);
+        (
+            cli,
+            tokio::spawn(serve_pairing_console(rd, wr, confirm.clone())),
+        )
+    }
+
+    /// A second console that answers `accept` as soon as it is asked.
+    fn live_console(confirm: &PairConfirm, accept: bool) -> crate::pair_confirm::ConsoleGuard {
+        let (guard, mut requests) = confirm.attach();
+        tokio::spawn(async move {
+            if let Some(request) = requests.recv().await {
+                request.answer(accept).await;
+            }
+        });
+        guard
+    }
+
+    /// A `portty pair` closed early (Ctrl-C, a closed window) used to stay
+    /// attached until the next request, then answer it "no" by failing to
+    /// write - refusing the pairing the user had restarted `portty pair` for.
+    #[tokio::test]
+    async fn a_closed_portty_pair_stops_being_asked_at_once() {
+        let confirm = PairConfirm::new();
+        let (cli, console) = spawn_pair_console(&confirm);
+        drop(cli);
+        tokio::time::timeout(std::time::Duration::from_secs(5), console)
+            .await
+            .expect("the console noticed the hang-up without being asked")
+            .unwrap()
+            .unwrap();
+
+        let _live = live_console(&confirm, true);
+        assert!(confirm.confirm(DeviceId([1; 16]), "phone", "123456").await);
+    }
+
+    /// Asked, then gone without answering: absent, not "no". Another console
+    /// still decides.
+    #[tokio::test]
+    async fn a_console_that_hangs_up_when_asked_leaves_the_decision_to_others() {
+        let confirm = PairConfirm::new();
+        let (mut cli, _console) = spawn_pair_console(&confirm);
+        // Attach the live console after the CLI one, so the CLI is asked too.
+        tokio::task::yield_now().await;
+        let (live_guard, mut live) = confirm.attach();
+        let deciding = {
+            let confirm = confirm.clone();
+            tokio::spawn(async move { confirm.confirm(DeviceId([2; 16]), "phone", "654321").await })
+        };
+        // The CLI receives its question, then quits without answering.
+        let asked = read_framed(&mut cli).await.unwrap();
+        assert!(matches!(
+            postcard::from_bytes::<HostToRelay>(&asked),
+            Ok(HostToRelay::PairingConfirmRequest { .. })
+        ));
+        drop(cli);
+        // Give the dropped answer time to land as a "no", as it used to.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        live.recv()
+            .await
+            .expect("the live console is asked")
+            .answer(true)
+            .await;
+        assert!(deciding.await.unwrap());
+        drop(live_guard);
+    }
+
+    /// Fail closed: the only console hanging up when asked still pairs nothing.
+    #[tokio::test]
+    async fn a_lone_console_hanging_up_when_asked_denies() {
+        let confirm = PairConfirm::new();
+        let (mut cli, _console) = spawn_pair_console(&confirm);
+        tokio::task::yield_now().await;
+        let deciding = {
+            let confirm = confirm.clone();
+            tokio::spawn(async move { confirm.confirm(DeviceId([3; 16]), "phone", "111222").await })
+        };
+        read_framed(&mut cli).await.unwrap();
+        drop(cli);
+        assert!(!deciding.await.unwrap());
+    }
+
+    /// An explicit "no" from the console is still a refusal.
+    #[tokio::test]
+    async fn an_explicit_no_refuses() {
+        let confirm = PairConfirm::new();
+        let (mut cli, _console) = spawn_pair_console(&confirm);
+        tokio::task::yield_now().await;
+        let deciding = {
+            let confirm = confirm.clone();
+            tokio::spawn(async move { confirm.confirm(DeviceId([4; 16]), "phone", "333444").await })
+        };
+        read_framed(&mut cli).await.unwrap();
+        let no =
+            postcard::to_allocvec(&RelayToHost::PairingConfirmResponse { accept: false }).unwrap();
+        write_framed(&mut cli, &no).await.unwrap();
+        assert!(!deciding.await.unwrap());
+    }
 
     #[tokio::test]
     async fn relay_framing_rejects_oversized_messages_both_directions() {

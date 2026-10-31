@@ -20,6 +20,18 @@ import {
   persistDecisionLog,
 } from "./lib/decisionLog";
 import { isSensitivePrompt, PredictiveEcho } from "./lib/echo";
+import { LinkGuard, needsLinkCheck, type LinkHold } from "./lib/linkGuard";
+import { systemUi } from "./lib/systemUi";
+import { UNLOCKED_EVENT, type UnlockedDetail } from "./BiometricGate";
+import { reconnectNotice } from "./lib/reconnectNotice";
+import {
+  friendlyError,
+  worthRetrying,
+  worthShowingAtLaunch,
+  type ErrorContext,
+  type FriendlyError,
+} from "./lib/friendlyError";
+import { ErrorNote } from "./ErrorNote";
 import {
   DEFAULT_POLICY,
   hasExactAllowRule,
@@ -42,31 +54,39 @@ import { Icon } from "./Icon";
 import { KeyBar } from "./KeyBar";
 import { CommandBar } from "./CommandBar";
 import { applyLatches, modifySequence } from "./lib/keys";
+import { installImeEditInput } from "./lib/imeInput";
 import { QrScanner } from "./QrScanner";
 import { AgentView } from "./AgentView";
+import { SetupHelp } from "./SetupHelp";
 import logo from "./assets/logo.png";
+import { AboutScreen, LicencesScreen } from "./About";
 
 /**
  * Portty phone UI.
  *
- * Four screens, driven by `view()`:
+ * The screens, driven by `view()`:
  *   - **list** (home): the sessions on the connected host, each named. Tap one
  *     to open (resume) it; the edit control renames it; the power control ends
  *     it (two-tap armed - the shell on the host dies). The disconnect control
  *     in the header drops the link without
  *     ending anything. A "New session" button goes to the pair screen. When
- *     there are no sessions, only that button shows.
- *   - **pair**: paste the host's `portty1:` ticket + PIN, scan the QR, or
- *     reconnect to the last host by stored token.
+ *     there are no sessions, only that button shows. With no saved host at
+ *     all, the list shows how to install the computer program and pair
+ *     (SetupHelp.tsx).
+ *   - **pair**: scan the QR from `portty pair` or paste its `portty1:` ticket,
+ *     then confirm the matching code on the computer; or reconnect to the
+ *     last host by stored token.
  *   - **terminal**: xterm.js + the accessory key bar for one session.
  *   - **agent**: a structured ACP feed for Claude Code, OpenCode, Codex, or Goose -
  *     messages, plans, tools, and approvals without mirroring a terminal TUI.
+ *   - **about** / **licences**: app and protocol versions, then the bundled
+ *     open-source notices (About.tsx). Reached from the home header.
  *
  * All terminal/agent work happens in the Rust core; this UI just invokes
  * commands and renders the `portty://*` events / binary output channel it emits.
  */
 
-type View = "list" | "pair" | "terminal" | "agent";
+type View = "list" | "pair" | "terminal" | "agent" | "about" | "licences";
 
 /** Convert a single letter to its control byte (Ctrl+C → 0x03). Null otherwise. */
 
@@ -90,6 +110,12 @@ const MAX_FONT = 24;
 // src-tauri/src/lib.rs, which stays authoritative - this only spares the user a
 // name that silently gets shortened on save.
 const MAX_HOST_NAME_LEN = 40;
+
+// Public pages the pair screen links to. Google Play wants the privacy policy
+// reachable inside the app as well as on the store listing, and the guide is
+// where a first-time user finds the computer program that screen asks for.
+const SETUP_GUIDE_URL = "https://portty.pages.dev/docs#quick-start";
+const PRIVACY_POLICY_URL = "https://portty.pages.dev/privacy";
 
 const policyKey = (host: string) => `portty:approval-policy:${host}`;
 /* Auto-opening an agent when an approval arrives is for the NOTIFICATION-TAP
@@ -171,7 +197,18 @@ export default function App() {
   // live-exchange value, never a saved credential.
   const [pairCode, setPairCode] = createSignal("");
   const [phrase, setPhrase] = createSignal("");
-  const [status, setStatus] = createSignal("not paired");
+  const [status, setStatus] = createSignal("Not connected");
+  // The last failure worth explaining, in plain words with its technical text
+  // (lib/friendlyError.ts). Shown on Home and on the pair screen until the next
+  // attempt, a success, or the person dismisses it.
+  const [problem, setProblem] = createSignal<FriendlyError | null>(null);
+  /** Report a failure in plain words. On Home and the pair screen it stays up,
+   *  with its details; anywhere else it passes as a status toast. */
+  const reportError = (error: unknown, context: ErrorContext, fallback?: string) => {
+    const failure = friendlyError(error, context, fallback);
+    if (view() === "list" || view() === "pair") setProblem(failure);
+    else setStatus(failure.message.replaceAll("`", ""));
+  };
 
   /** Whether we hold an out-of-band secret to pair WITH.
    *
@@ -276,6 +313,14 @@ export default function App() {
   // QR pairing: when true, the pair screen shows the camera scanner.
   const [scanning, setScanning] = createSignal(false);
   const [scanError, setScanError] = createSignal("");
+  // The pairing-code field, so "Paste code instead" (no usable camera) can put
+  // the cursor straight in it - the keyboard's paste key is then one tap away.
+  let ticketField: HTMLTextAreaElement | undefined;
+  const pasteCodeInstead = () => {
+    setScanError("");
+    setScanning(false);
+    requestAnimationFrame(() => ticketField?.focus());
+  };
   // Inline rename on the session list: which session is being renamed + its text.
   const [renamingId, setRenamingId] = createSignal<number | null>(null);
   const [renameText, setRenameText] = createSignal("");
@@ -328,12 +373,22 @@ export default function App() {
   // Loaded at mount too (cheap local store read): the home footer and first-run
   // empty state branch on "are there saved hosts at all", not just the pair
   // screen.
+  //
+  // Until that first read lands, an empty list means "not read yet", not "no
+  // saved hosts" - so the first-run setup card waits for it instead of flashing
+  // up on every launch for someone who has hosts.
+  const [hostsLoaded, setHostsLoaded] = createSignal(false);
   onMount(() => {
     portty
       .listHosts()
       .then(setHostList)
-      .catch(() => setHostList([]));
+      .catch(() => setHostList([]))
+      .finally(() => setHostsLoaded(true));
   });
+  /** First run: no saved host, so Home shows how to get the computer program
+   *  and pair (SetupHelp) instead of the plain empty state. Never while paired:
+   *  right after a first pairing the host list is still catching up. */
+  const showSetupHelp = () => hostsLoaded() && !paired() && hostList().length === 0;
   createEffect(() => {
     if (view() === "pair") {
       portty
@@ -506,20 +561,78 @@ export default function App() {
   let reconnectTimer: number | undefined;
   let disconnectedAt = 0;
   let sweepTimer: number | undefined;
-  const [reconnectToast, setReconnectToast] = createSignal(false);
+  // What an auto-reconnect came back to - decided by lib/reconnectNotice.ts once
+  // the host's session list says whether the open session survived.
+  const [reconnectToast, setReconnectToast] = createSignal("");
+  let reconnectToastTimer: number | undefined;
+  const showReconnectToast = (message: string, ms: number) => {
+    setReconnectToast(message);
+    window.clearTimeout(reconnectToastTimer);
+    reconnectToastTimer = window.setTimeout(() => setReconnectToast(""), ms);
+  };
+
+  // Typing that was refused or dropped instead of sent. Its own notice rather
+  // than the status toast: that one does not render on the home list, which is
+  // exactly where a drop usually lands (back to the list, or auto-reconnect
+  // giving up).
+  const [inputNotice, setInputNotice] = createSignal("");
+  let inputNoticeTimer: number | undefined;
+  const showInputNotice = (message: string) => {
+    setInputNotice(message);
+    window.clearTimeout(inputNoticeTimer);
+    inputNoticeTimer = window.setTimeout(() => setInputNotice(""), 4000);
+  };
+
+  /** The live write path. Typing reaches it through `linkGuard` (via
+   *  `sendInput`), which holds it while the link is not known to work. */
+  const deliverInput = (id: number, s: string) => {
+    // A submitted/cancelled command can hand control to a password reader
+    // whose prompt wording we do not recognize. Never carry learned echo
+    // confidence across that boundary; rebuild it from authoritative output.
+    if (/[\r\n\x03\x04\x1a]/.test(s)) {
+      const erase = echo.commandBoundary();
+      if (erase) term?.write(erase);
+    }
+    echo.noteSent(s, performance.now());
+    // A refused write (the link ended a moment before the app heard) must not
+    // vanish either.
+    portty.input(id, s).catch((e) => {
+      showInputNotice(`Not sent: ${e}`);
+      if (isNotPaired(e)) noticeLinkGone();
+    });
+  };
+
+  // After a long background the link may be dead while still accepting writes
+  // (they land in the local QUIC buffer), so typing is held until it is proven
+  // or rebuilt - see lib/linkGuard.ts. `linkHold` drives the banner saying so.
+  const [linkHold, setLinkHold] = createSignal<LinkHold | null>(null);
+  const linkGuard = new LinkGuard({
+    ping: portty.pingHost,
+    // Retiring the link emits `portty://disconnected`; the silent-drop handler
+    // below then reconnects and re-attaches, exactly as for any other drop. If
+    // the core had already lost the link there is nothing to retire and no
+    // event comes, so the screen is told here instead of saying "Connected".
+    dropLink: () => {
+      portty
+        .disconnect()
+        .then((dropped) => {
+          if (!dropped) noticeLinkGone();
+        })
+        .catch(() => {});
+    },
+    linkSettled: () => paired() && !connecting(),
+    deliver: deliverInput,
+    notify: showInputNotice,
+    onHold: (hold) => setLinkHold(hold),
+  });
+  // Held typing belongs to the session it was typed in. Leaving that session -
+  // back to the list, auto-reconnect giving up, a host switch, the session
+  // ending - drops it, with a notice when anything was held.
+  createEffect(on([view, activeId], () => linkGuard.abandon(), { defer: true }));
 
   const sendInput = (s: string) => {
-    if (activeId() != null) {
-      // A submitted/cancelled command can hand control to a password reader
-      // whose prompt wording we do not recognize. Never carry learned echo
-      // confidence across that boundary; rebuild it from authoritative output.
-      if (/[\r\n\x03\x04\x1a]/.test(s)) {
-        const erase = echo.commandBoundary();
-        if (erase) term?.write(erase);
-      }
-      echo.noteSent(s, performance.now());
-      portty.input(activeId()!, s);
-    }
+    const id = activeId();
+    if (id != null) linkGuard.input(id, s);
   };
 
   // Alt-screen detector for the byte stream (client-side VT awareness; the
@@ -930,7 +1043,7 @@ export default function App() {
           void portty
             .openExternal(uri)
             .then(() => setStatus(`opened ${uri} in your browser`))
-            .catch((error) => setStatus(`could not open that link: ${error}`));
+            .catch((error) => reportError(error, "general", "Couldn't open that link."));
         },
       },
       // On-brand theme: true black canvas, lime cursor + selection (the vortex).
@@ -948,6 +1061,10 @@ export default function App() {
     fit = new FitAddon();
     term.loadAddon(fit);
     term.open(termEl);
+    // Hardware keyboards on Android arrive as keyboard-app edits that xterm
+    // 6.0.0 scrambles; send each edit exactly as the browser reports it (S15,
+    // see lib/imeInput.ts). Lives as long as the terminal - no teardown needed.
+    installImeEditInput(term);
     cellRatio = measureCellRatio(term.options.fontFamily ?? "monospace");
     fit.fit();
     syncLocalDisplayMode();
@@ -1252,9 +1369,10 @@ export default function App() {
     portty.attach(id).catch((e) => {
       setAttaching(false);
       if (activeId() === id && view() === "terminal") {
-        setStatus(`${e}`);
         setActiveId(null);
         setView("list");
+        // On the list, so it lands on the Home status line.
+        reportError(e, "session", "Couldn't open that session.");
       }
     });
     // The terminal was display:none until now; relayout once it's laid out.
@@ -1288,9 +1406,9 @@ export default function App() {
     setSessions((p) => p.map((s) => (s.id === id ? { ...s, has_activity: false } : s)));
     portty.attach(id).catch((e) => {
       if (activeId() === id && view() === "agent") {
-        setStatus(`${e}`);
         setActiveId(null);
         setView("list");
+        reportError(e, "session", "Couldn't open that session.");
       }
     });
   };
@@ -1399,7 +1517,13 @@ export default function App() {
   };
   const showPickerError = (title: string, raw: unknown) => {
     setDirErrorTitle(title);
-    setDirError(cleanHostError(`${raw}`));
+    // A lost link, a timeout or an ended session gets plain words. Anything
+    // else is the host's own explanation - it names a missing adapter and its
+    // fix - so it stays, tidied.
+    const failure = friendlyError(raw, "session");
+    setDirError(
+      failure.kind === "failed" ? cleanHostError(`${raw}`) : failure.message.replaceAll("`", ""),
+    );
   };
 
   /** The workspace root has no parent to reach - `..` is refused by the host. */
@@ -1498,7 +1622,6 @@ export default function App() {
       attachAgent(id);
     } catch (e) {
       showPickerError("Couldn't resume that conversation", e);
-      setStatus(`could not resume: ${e}`);
     } finally {
       setCreatingAgent(false);
     }
@@ -1579,7 +1702,6 @@ export default function App() {
       // it - which reads as the button doing nothing at all. The host's message
       // names the missing adapter and the fix; it just has to be seen.
       showPickerError(`Couldn't start ${PROVIDER_LABEL[provider] ?? provider}`, e);
-      setStatus(`could not start agent: ${e}`);
     } finally {
       setCreatingAgent(false);
     }
@@ -1750,7 +1872,6 @@ export default function App() {
       // middle of the screen otherwise reads as the button doing nothing (same
       // reasoning as startAgent).
       showPickerError("Couldn't open a session there", e);
-      setStatus(`could not create session: ${e}`);
     } finally {
       setCreating(false);
     }
@@ -1849,7 +1970,7 @@ export default function App() {
       await portty.agentPrompt(id, text);
       return true;
     } catch (e) {
-      setStatus(`could not send prompt: ${e}`);
+      reportError(e, "agent", "Couldn't send your message.");
       return false;
     } finally {
       setSendingPrompt(false);
@@ -1864,7 +1985,7 @@ export default function App() {
     try {
       await portty.agentCancel(id);
     } catch (error) {
-      setStatus(`could not stop agent turn: ${error}`);
+      reportError(error, "agent", "Couldn't stop the agent.");
     } finally {
       setStoppingAgent(false);
     }
@@ -1877,7 +1998,7 @@ export default function App() {
       await portty.agentSetMode(id, modeId);
       return true;
     } catch (error) {
-      setStatus(`could not change agent mode: ${error}`);
+      reportError(error, "agent", "Couldn't change the agent's mode.");
       return false;
     }
   };
@@ -1889,7 +2010,7 @@ export default function App() {
       await portty.agentSetConfig(id, configId, value);
       return true;
     } catch (error) {
-      setStatus(`could not change agent setting: ${error}`);
+      reportError(error, "agent", "Couldn't change that setting.");
       return false;
     }
   };
@@ -1901,7 +2022,7 @@ export default function App() {
       await portty.agentAuthenticate(id, methodId);
       return true;
     } catch (error) {
-      setStatus(`could not authenticate agent: ${error}`);
+      reportError(error, "agent", "Couldn't sign the agent in.");
       return false;
     }
   };
@@ -1926,7 +2047,7 @@ export default function App() {
         logDecision(request, source, tier);
       })
       .catch((e) => {
-        setStatus(`could not send permission decision: ${e}`);
+        reportError(e, "agent", "Couldn't send your answer to the agent.");
         setPermissions((items) =>
           items.some((item) => samePermission(item, request)) ? items : [...items, request],
         );
@@ -1962,7 +2083,7 @@ export default function App() {
         logDecision(request, "learned-exact", "exact");
       })
       .catch((error) => {
-        setStatus(`could not send permission decision: ${error}`);
+        reportError(error, "agent", "Couldn't send your answer to the agent.");
         setPermissions((items) =>
           items.some((item) => samePermission(item, request)) ? items : [...items, request],
         );
@@ -2072,7 +2193,7 @@ export default function App() {
       .catch((e) => {
         // Decision never landed: surface the card after all (fail closed).
         autoDecided.delete(callKey);
-        setStatus(`could not send permission decision: ${e}`);
+        reportError(e, "agent", "Couldn't send your answer to the agent.");
         setPermissions((items) =>
           items.some((item) => samePermission(item, request)) ? items : [...items, request],
         );
@@ -2097,12 +2218,48 @@ export default function App() {
   };
 
   const startUpload = async () => {
-    const localPath = await open({ multiple: false, directory: false });
+    const localPath = await systemUi.run(() => open({ multiple: false, directory: false }));
     if (typeof localPath !== "string") return;
-    setTransferPath(localPath.split(/[\\/]/).at(-1) ?? "upload");
+    // Android returns a `content://` document, whose last segment is an opaque
+    // id such as `document%3A83`, and iOS a `file://` URL, whose name is escaped
+    // (`My%20Report.pdf`) - ask the core for the real name.
+    setTransferPath(
+      /^(content|file):\/\//.test(localPath)
+        ? await portty.suggestUploadName(localPath).catch(() => "upload")
+        : (localPath.split(/[\\/]/).at(-1) ?? "upload"),
+    );
     setTransferOutside(false);
     setTransferSheet({ mode: "upload", localPath });
   };
+
+  // A failed transfer in plain words, while the transfer line still shows it
+  // (progress or the next transfer replaces the line, and the failure with it).
+  // A note can follow it on the same line - a leftover empty file, say.
+  const [transferFailure, setTransferFailure] = createSignal<FriendlyError | null>(null);
+  const transferProblem = () => {
+    const failure = transferFailure();
+    return failure && transferStatus().startsWith(failure.message) ? failure : null;
+  };
+  // Which way each transfer goes: a failure event names only the id, and "the
+  // file isn't there" means this phone for an upload, the computer for a
+  // download.
+  const transferDirections = new Map<number, "upload" | "download">();
+  const showTransferError = (error: unknown, direction: "upload" | "download") => {
+    const failure = friendlyError(error, direction);
+    setTransferFailure(failure);
+    setTransferStatus(failure.message);
+    if (isNotPaired(error)) noticeLinkGone();
+  };
+  // A failure note is several lines where progress is one: refit the terminal
+  // when the line changes shape, or its last rows - the prompt - sit hidden
+  // under the note until the next resize. Progress ticks alone change nothing.
+  let transferShape = "";
+  createEffect(() => {
+    const shape = transferProblem() ? "note" : transferStatus() ? "bar" : "";
+    if (shape === transferShape) return;
+    transferShape = shape;
+    if (view() === "terminal") requestAnimationFrame(() => applyLayout());
+  });
 
   const submitTransfer = async () => {
     const sheet = transferSheet();
@@ -2110,20 +2267,38 @@ export default function App() {
     if (!sheet || !hostPath) return;
     setTransferSheet(null);
     if (sheet.mode === "download") {
-      const localPath = await save({ defaultPath: hostPath.split(/[\\/]/).at(-1) ?? "download" });
+      // Ask the host first: Android's Save dialog creates the file as soon as
+      // Save is tapped, and some phones cannot delete it again if the host then
+      // refuses (no such file, outside home, too large). On iOS the core refuses
+      // here too: nothing could be written into the file iOS's dialog makes.
+      try {
+        await portty.probeDownload(hostPath, transferOutside());
+      } catch (error) {
+        showTransferError(error, "download");
+        return;
+      }
+      const localPath = await systemUi.run(() =>
+        save({ defaultPath: hostPath.split(/[\\/]/).at(-1) ?? "download" }),
+      );
       if (!localPath) return;
       try {
-        await portty.downloadFile(hostPath, localPath, transferOutside());
+        transferDirections.set(
+          await portty.downloadFile(hostPath, localPath, transferOutside()),
+          "download",
+        );
         setTransferStatus("Download started");
       } catch (error) {
-        setTransferStatus(`Download failed: ${error}`);
+        showTransferError(error, "download");
       }
     } else {
       try {
-        await portty.uploadFile(sheet.localPath, hostPath, transferOutside());
+        transferDirections.set(
+          await portty.uploadFile(sheet.localPath, hostPath, transferOutside()),
+          "upload",
+        );
         setTransferStatus("Upload started");
       } catch (error) {
-        setTransferStatus(`Upload failed: ${error}`);
+        showTransferError(error, "upload");
       }
     }
   };
@@ -2177,6 +2352,12 @@ export default function App() {
         case "pair":
           setScanning(false);
           setView("list");
+          return true;
+        case "about":
+          setView("list");
+          return true;
+        case "licences":
+          setView("about");
           return true;
         default:
           // 3) Home list with nothing open → let Android background the app.
@@ -2258,7 +2439,7 @@ export default function App() {
             setView("list");
           }
         })
-        .catch((e) => setStatus(`${e}`));
+        .catch((e) => reportError(e, "session", "Couldn't end that session."));
     } else {
       setArmedKillId(id);
       window.clearTimeout(armedKillTimer);
@@ -2306,15 +2487,17 @@ export default function App() {
         scanner.reset();
         setStatus(
           removal.remote_revoked
-            ? "pair ended on both devices"
-            : "removed here - laptop could not confirm revocation",
+            ? "Removed. This phone and the computer are no longer paired."
+            : "Removed from this phone. The computer didn't confirm - run portty unpair there.",
         );
       } else {
-        setStatus("saved host removed locally - revoke it on the laptop if needed");
+        setStatus(
+          "Removed from this phone. To remove it on the computer too, run portty unpair there.",
+        );
       }
     } catch (e) {
       if (removingCurrent) manualDisconnect = false;
-      setStatus(`could not remove host: ${e}`);
+      reportError(e, "general", "Couldn't remove that computer.");
     }
   };
 
@@ -2353,9 +2536,9 @@ export default function App() {
             : saved,
         ),
       );
-      setStatus(nickname ? `host renamed to ${nickname}` : "host name reset to its hostname");
+      setStatus(nickname ? `Renamed to ${nickname}.` : "Name reset to the computer's own name.");
     } catch (e) {
-      setStatus(`could not rename host: ${e}`);
+      reportError(e, "general", "Couldn't rename that computer.");
     }
   };
 
@@ -2400,8 +2583,8 @@ export default function App() {
     }
     setStatus(
       failures
-        ? `could not remove ${failures} saved host${failures === 1 ? "" : "s"}`
-        : "all saved hosts removed - pair again to reconnect",
+        ? `Couldn't remove ${failures} saved computer${failures === 1 ? "" : "s"}. Try again.`
+        : "All saved computers removed. Pair again to connect.",
     );
   };
 
@@ -2439,6 +2622,13 @@ export default function App() {
     resetPolicyToLoading();
   };
 
+  // Our own pages, opened in the system browser like any other link.
+  const openLink = (url: string) => {
+    void portty
+      .openExternal(url)
+      .catch((error) => setStatus(`could not open that link: ${error}`));
+  };
+
   const doPair = async () => {
     if (connecting()) return; // one connection op at a time
     setConnecting(true);
@@ -2447,7 +2637,8 @@ export default function App() {
     // and a stuck manualDisconnect must not suppress future auto-reconnects.
     manualDisconnect = false;
     if (reconnectTimer) clearTimeout(reconnectTimer);
-    setStatus("connecting…");
+    setProblem(null);
+    setStatus("Connecting…");
     try {
       // ALWAYS drop the previous connection first. The core keeps the old
       // (possibly dead) channel around after a silent drop - without this,
@@ -2469,10 +2660,12 @@ export default function App() {
       await selectPolicyHost();
       setPaired(true);
       disconnectedAt = 0;
-      setStatus("paired");
+      setStatus("Connected");
       setView("list");
     } catch (e) {
-      setStatus(`pair failed: ${e}`);
+      // The core says what went wrong and what to do (see connect_error.rs).
+      setProblem(friendlyError(e, "pair"));
+      setStatus("Not connected");
     } finally {
       setConnecting(false);
       setPairCode("");
@@ -2487,7 +2680,8 @@ export default function App() {
     // See doPair: consume disconnect intent + cancel any scheduled auto-retry.
     manualDisconnect = false;
     if (reconnectTimer) clearTimeout(reconnectTimer);
-    setStatus("resuming…");
+    setProblem(null);
+    setStatus("Connecting to your computer…");
     try {
       await portty.disconnect().catch(() => {});
       resetForHostChange();
@@ -2496,10 +2690,13 @@ export default function App() {
       await selectPolicyHost(host);
       setPaired(true);
       disconnectedAt = 0;
-      setStatus("paired");
+      setStatus("Connected");
       setView("list");
     } catch (e) {
-      setStatus(`reconnect failed: ${e}`);
+      // Only a refused saved pairing asks to pair again; an unreachable or
+      // out-of-date computer says so instead (see connect_error.rs).
+      setProblem(friendlyError(e, "reconnect"));
+      setStatus("Not connected");
     } finally {
       setConnecting(false);
     }
@@ -2511,7 +2708,9 @@ export default function App() {
   const tryAutoReconnect = async () => {
     if (paired() || connecting()) return;
     setConnecting(true);
-    setStatus(`reconnecting… (${reconnectAttempt + 1})`);
+    // Any earlier failure stays until this one settles: a retry running in the
+    // background must not wipe what a failed pair just said on screen.
+    setStatus(`Reconnecting to your computer… (try ${reconnectAttempt + 1})`);
     try {
       await portty.disconnect().catch(() => {});
       resetPolicyToLoading();
@@ -2519,11 +2718,10 @@ export default function App() {
       reconnectAttempt = 0;
       await selectPolicyHost();
       setPaired(true);
-      setStatus("paired");
-      if (disconnectedAt && Date.now() - disconnectedAt > 3000) {
-        setReconnectToast(true);
-        window.setTimeout(() => setReconnectToast(false), 2400);
-      }
+      setProblem(null);
+      setStatus("Connected");
+      // Down long enough to have been seen go: the reconnect earns a toast.
+      const noticeable = disconnectedAt > 0 && Date.now() - disconnectedAt > 3000;
       disconnectedAt = 0;
       // Drop the user back into the session they were viewing.
       const want = activeId();
@@ -2533,9 +2731,9 @@ export default function App() {
         // terminal with no way back - fall back to the list like attachTo does.
         const strandGuard = (e: unknown) => {
           if (activeId() === want && (view() === "terminal" || view() === "agent")) {
-            setStatus(`${e}`);
             setActiveId(null);
             setView("list");
+            reportError(e, "session", "Couldn't reopen that session.");
           }
         };
         if (view() === "terminal") {
@@ -2550,19 +2748,48 @@ export default function App() {
         } else {
           portty.attach(want).catch(strandGuard);
         }
+        // Back on a working link. Once the host's session list says whether this
+        // session survived, send what was typed while it was down - then say so
+        // in ONE message. A restarted host has none of its old sessions, and
+        // ignores a resume for an id it does not know, so `strandGuard` never
+        // fires for a terminal: without this the user sat on the dead screen,
+        // told "session restored".
+        linkGuard.reattached(want, ({ survived, unsent }) => {
+          const notice = reconnectNotice({ session: want, survived, unsent, noticeable });
+          if (
+            notice.backToList &&
+            activeId() === want &&
+            (view() === "terminal" || view() === "agent")
+          ) {
+            // Leave it the way a session that ends under the user does
+            // (`onRemoved`): clear the stale screen, back to the list.
+            term?.reset();
+            setActiveId(null);
+            setView("list");
+          }
+          if (notice.message) showReconnectToast(notice.message, notice.backToList ? 4000 : 2400);
+        });
+      } else {
+        const notice = reconnectNotice({ session: null, survived: false, unsent: 0, noticeable });
+        if (notice.message) showReconnectToast(notice.message, 2400);
       }
-    } catch {
+    } catch (e) {
+      const failure = friendlyError(e, "reconnect");
       reconnectAttempt++;
-      if (reconnectAttempt < 6) {
+      // Retrying cannot fix an out-of-date program or a refused pairing - it
+      // only delays the message that says what to do.
+      if (reconnectAttempt < 6 && worthRetrying(failure)) {
         reconnectTimer = window.setTimeout(
           () => void tryAutoReconnect(),
           Math.min(8000, 1000 * 2 ** reconnectAttempt),
         );
       } else {
         reconnectAttempt = 0;
-        setStatus("disconnected - reconnect from the home screen");
+        setStatus("Not connected");
         setActiveId(null);
         if (view() === "terminal" || view() === "agent") setView("list");
+        // Nothing saved (first run) is not a failure worth a message.
+        if (failure.kind !== "no_saved_host") setProblem(failure);
       }
     } finally {
       // Release the in-flight guard on every path - including before a scheduled
@@ -2578,7 +2805,10 @@ export default function App() {
 
   const commitRename = (id: number) => {
     const t = renameText().trim();
-    if (t) portty.rename(id, t).catch((e) => setStatus(`${e}`));
+    if (t)
+      portty
+        .rename(id, t)
+        .catch((e) => reportError(e, "session", "Couldn't rename that session."));
     setRenamingId(null);
   };
 
@@ -2587,6 +2817,65 @@ export default function App() {
    *  and after a failure. No amber "busy" state: a single dot is enough to say
    *  connected-or-not at a glance (transient detail still lives in the toasts). */
   const statusState = (): "ok" | "err" => (paired() ? "ok" : "err");
+  /** The words beside the dot on Home, when it is red and there is a computer
+   *  to connect to: "Not connected", "Reconnecting…", "Disconnected…". A first
+   *  run (nothing saved) stays quiet - the setup help speaks then. */
+  const homeState = () => (!paired() && hostList().length > 0 ? status() : "");
+
+  // The link to the computer is gone: the core said so (`portty://disconnected`),
+  // or a command just failed because it has none. Hold typing, show it, and
+  // reconnect unless the user disconnected on purpose.
+  const onLinkLost = () => {
+    // Void any link check in flight, and hold terminal typing until the link
+    // is back. A self-induced drop (connect op running) holds nothing new:
+    // that op settles the hold itself.
+    linkGuard.linkLost(!connecting() && view() === "terminal" ? activeId() : null);
+    // A deliberate pair/reconnect drops the old link first; that self-induced
+    // `disconnected` must NOT start a competing auto-reconnect - the in-flight
+    // op owns the transition and will set the final state itself.
+    if (connecting()) return;
+    setPaired(false);
+    disconnectedAt = Date.now();
+    setPaused(false);
+    setSessions([]);
+    // Drop pending approval cards: a tap on a dead link resolves nothing,
+    // and the host replays every still-pending card after the reconnect
+    // snapshot - so stale cards can't survive a drop and mis-resolve.
+    setPermissions([]);
+    // Echo confidence/RTT belong to the dead link; decisions sent on it
+    // are void. Policy drops to the fail-closed sentinel until the next
+    // connect re-selects the host.
+    echo.reset();
+    autoDecided = new Set();
+    resetPolicyToLoading();
+    setStatus("Lost the connection to your computer.");
+    if (manualDisconnect) {
+      // User disconnected deliberately - respect it, no auto-reconnect.
+      // Point at the one-tap recovery so a deliberate disconnect never feels
+      // stranded on a re-pair form. Also cancel any already-scheduled
+      // auto-retry - a stale timer firing after a deliberate disconnect would
+      // reconnect against the user's intent.
+      manualDisconnect = false;
+      if (reconnectTimer) clearTimeout(reconnectTimer);
+      setStatus(
+        "Disconnected. Your sessions keep running on your computer - tap Reconnect to continue.",
+      );
+      setActiveId(null);
+      if (view() === "terminal" || view() === "agent") setView("list");
+      return;
+    }
+    // Silent drop (doze/host restart/Wi-Fi) - reconnect automatically and
+    // keep the user's place (activeId survives for the re-attach).
+    reconnectAttempt = 0;
+    void tryAutoReconnect();
+  };
+  const isNotPaired = (error: unknown) => /not paired/.test(String(error));
+  // The screen still says "Connected" but the core has no link - it was lost
+  // while the app was paused (say, behind the fingerprint prompt) and the
+  // event never landed. Treat it as the drop it was, once.
+  const noticeLinkGone = () => {
+    if (paired() && !connecting()) onLinkLost();
+  };
 
   onMount(async () => {
     const unlistens: Array<() => void> = [];
@@ -2594,6 +2883,7 @@ export default function App() {
       await portty.onList((s) => {
         // Show the list - do NOT auto-open a terminal. The user picks one.
         setSessions(s);
+        linkGuard.sessionsListed(s.map((session) => session.id));
       }),
     );
     unlistens.push(
@@ -2702,6 +2992,7 @@ export default function App() {
     );
     unlistens.push(
       await portty.onTransferProgress((progress) => {
+        transferDirections.set(progress.id, progress.direction);
         const total = progress.total ? ` / ${Math.round(progress.total / 1024)} KiB` : "";
         setTransferStatus(
           `${progress.direction === "upload" ? "Uploading" : "Downloading"} ${Math.round(progress.transferred / 1024)} KiB${total}`,
@@ -2714,7 +3005,16 @@ export default function App() {
       }),
     );
     unlistens.push(
-      await portty.onTransferError((error) => setTransferStatus(`Transfer failed: ${error.message}`)),
+      // A transfer resumed after a reconnect has no direction on record yet; a
+      // download is the only kind that resumes.
+      await portty.onTransferError((error) =>
+        showTransferError(error.message, transferDirections.get(error.id) ?? "download"),
+      ),
+    );
+    unlistens.push(
+      await portty.onTransferNote((note) =>
+        setTransferStatus((current) => (current ? `${current} ${note.message}` : note.message)),
+      ),
     );
     unlistens.push(
       await portty.onPermissionResolved((resolved) => {
@@ -2787,64 +3087,33 @@ export default function App() {
         setActiveId(null);
         term?.reset();
         scanner.reset();
-        setStatus("pair ended by laptop");
+        setStatus("Not connected");
+        setProblem(friendlyError("pair revoked by the computer", "reconnect"));
         if (view() === "terminal" || view() === "agent") setView("list");
       }),
     );
     unlistens.push(
-      await portty.onDisconnected(() => {
-        // A deliberate pair/reconnect drops the old link first; that self-induced
-        // `disconnected` must NOT start a competing auto-reconnect - the in-flight
-        // op owns the transition and will set the final state itself.
-        if (connecting()) return;
-        setPaired(false);
-        disconnectedAt = Date.now();
-        setPaused(false);
-        setSessions([]);
-        // Drop pending approval cards: a tap on a dead link resolves nothing,
-        // and the host replays every still-pending card after the reconnect
-        // snapshot - so stale cards can't survive a drop and mis-resolve.
-        setPermissions([]);
-        // Echo confidence/RTT belong to the dead link; decisions sent on it
-        // are void. Policy drops to the fail-closed sentinel until the next
-        // connect re-selects the host.
-        echo.reset();
-        autoDecided = new Set();
-        resetPolicyToLoading();
-        setStatus("disconnected");
-        if (manualDisconnect) {
-          // User disconnected deliberately - respect it, no auto-reconnect.
-          // Point at the one-tap recovery so a deliberate disconnect never feels
-          // stranded on a re-pair form. Also cancel any already-scheduled
-          // auto-retry - a stale timer firing after a deliberate disconnect would
-          // reconnect against the user's intent.
-          manualDisconnect = false;
-          if (reconnectTimer) clearTimeout(reconnectTimer);
-          setStatus("disconnected - tap Reconnect to resume");
-          setActiveId(null);
-          if (view() === "terminal" || view() === "agent") setView("list");
-          return;
-        }
-        // Silent drop (doze/host restart/Wi-Fi) - reconnect automatically and
-        // keep the user's place (activeId survives for the re-attach).
-        reconnectAttempt = 0;
-        void tryAutoReconnect();
-      }),
+      await portty.onDisconnected(onLinkLost),
     );
     onCleanup(() => unlistens.forEach((u) => u()));
 
     // Visibility transitions:
     //  - hidden  → Detach, so the host STOPS streaming to a backgrounded app
     //              (saves battery/data). It keeps buffering into its ring.
-    //  - visible → if unpaired, reconnect; if paired, re-attach - which both
-    //              resumes streaming AND acts as a liveness probe (a dead link
-    //              fails the write, fires disconnected, and auto-reconnect runs).
-    //              The host precedes the re-attach snapshot with a ScreenReset,
-    //              so xterm is cleared first (no duplicated output).
+    //  - visible → if unpaired, reconnect; if paired, re-attach to resume
+    //              streaming. The host precedes the re-attach snapshot with a
+    //              ScreenReset, so xterm is cleared first (no duplicated output).
+    //              Re-attach is NOT a liveness probe: a write to a link the host
+    //              already dropped still "succeeds" into the local QUIC buffer,
+    //              and the phone only notices at its 30 s idle timeout. So after
+    //              a long absence the link is proven first (lib/linkGuard.ts).
     let wasHidden = document.visibilityState === "hidden";
+    // Wall clock on purpose: a monotonic one stops while the phone sleeps.
+    let hiddenAt = Date.now();
     const onVisibility = () => {
       if (document.visibilityState === "hidden") {
         wasHidden = true;
+        hiddenAt = Date.now();
         if (connecting()) return; // a connect op is already in flight
         if (
           paired() &&
@@ -2859,6 +3128,13 @@ export default function App() {
       if (!wasHidden) return;
       wasHidden = false;
       if (connecting()) return; // a connect op is already in flight
+      // Away long enough for Android to have frozen us and the host to have
+      // dropped the link: prove it with one round trip before trusting it, and
+      // hold terminal typing until then. Started now, before any await, so not
+      // one keystroke can reach an unproven link. A quick resume skips this.
+      if (paired() && needsLinkCheck(Date.now() - hiddenAt)) {
+        void linkGuard.verify(view() === "terminal" ? activeId() : null);
+      }
       // A push-notification tap may have brought us forward: the wake blob
       // names WHICH host rang. Reconnect there (host switch included) so the
       // replayed approval card lands on screen.
@@ -2882,17 +3158,17 @@ export default function App() {
             echo.reset();
             portty.resumeOutput(id).catch((e) => {
               if (activeId() === id && view() === "terminal") {
-                setStatus(`${e}`);
                 setActiveId(null);
                 setView("list");
+                reportError(e, "session", "Couldn't reopen that session.");
               }
             });
           } else {
             portty.attach(id).catch((e) => {
               if (activeId() === id && view() === "agent") {
-                setStatus(`${e}`);
                 setActiveId(null);
                 setView("list");
+                reportError(e, "session", "Couldn't reopen that session.");
               }
             });
           }
@@ -2903,8 +3179,18 @@ export default function App() {
       })();
     };
     document.addEventListener("visibilitychange", onVisibility);
+    // The fingerprint prompt on a return pauses the app underneath, and a link
+    // left idle that long may have died without the app hearing. Prove it, as
+    // after any long absence; a dead one is rebuilt before typing reaches it.
+    const onUnlocked = (event: Event) => {
+      const { lockedForMs } = (event as CustomEvent<UnlockedDetail>).detail;
+      if (connecting() || !paired() || !needsLinkCheck(lockedForMs)) return;
+      void linkGuard.verify(view() === "terminal" ? activeId() : null);
+    };
+    window.addEventListener(UNLOCKED_EVENT, onUnlocked);
     onCleanup(() => {
       document.removeEventListener("visibilitychange", onVisibility);
+      window.removeEventListener(UNLOCKED_EVENT, onUnlocked);
       window.removeEventListener("resize", onWinResize);
       const ta = termTextarea();
       ta?.removeEventListener("focus", onTaFocus);
@@ -2922,7 +3208,7 @@ export default function App() {
     // (empty) home, where "New session" opens pairing.
     setConnecting(true);
     try {
-      setStatus("resuming…");
+      setStatus("Connecting to your computer…");
       const wakeHost = await portty.consumePushWake().catch(() => null);
       // Cold start from a notification tap - same allowance as the resume path.
       if (wakeHost) armWakeAttach();
@@ -2930,9 +3216,13 @@ export default function App() {
       await portty.reconnect(outputCb, sizeCb, wakeHost ?? undefined);
       await selectPolicyHost(wakeHost ?? undefined);
       setPaired(true);
-      setStatus("paired");
-    } catch {
-      setStatus("not paired");
+      setStatus("Connected");
+    } catch (e) {
+      setStatus("Not connected");
+      // Explain only what needs the person (an out-of-date program, a refused
+      // pairing); a computer that is simply off waits for a tap on Reconnect.
+      const failure = friendlyError(e, "reconnect");
+      if (worthShowingAtLaunch(failure)) setProblem(failure);
     } finally {
       setConnecting(false);
     }
@@ -2944,11 +3234,20 @@ export default function App() {
       classList={{ "portty-app--term": view() === "terminal" || view() === "agent" }}
     >
       <Show when={reconnectToast()}>
-        <div class="portty-reconnect-toast">Reconnected - session restored</div>
+        <div class="portty-reconnect-toast" role="status">
+          {reconnectToast()}
+        </div>
+      </Show>
+      {/* Typing that was refused or dropped instead of sent - on every screen,
+          and in the status toast's slot, which yields to it meanwhile. */}
+      <Show when={inputNotice()}>
+        <div class="portty-reconnect-toast portty-status-toast" role="status">
+          {inputNotice()}
+        </div>
       </Show>
       {/* Status changes are only visible in the home header's pill; away from
           home they'd vanish - surface them as a transient toast instead. */}
-      <Show when={statusToast() && !showsStatusInline(view())}>
+      <Show when={statusToast() && !showsStatusInline(view()) && !inputNotice()}>
         <div class="portty-reconnect-toast portty-status-toast">{statusToast()}</div>
       </Show>
       {/* ── TERMINAL ── always mounted so xterm survives view switches; hidden
@@ -3040,6 +3339,28 @@ export default function App() {
           </div>
         </header>
 
+        {/* The link is being checked after a long background, or rebuilt after
+            a drop (host offline included): typing is held, not lost, and this
+            says so. Fixed in the reconnect toast's slot - that toast only shows
+            once this is gone. */}
+        <Show when={linkHold()}>
+          {(hold) => (
+            <div
+              class="portty-link-banner"
+              classList={{ "portty-link-banner--checking": hold() === "checking" }}
+              role="status"
+              aria-live="polite"
+            >
+              <span class="portty-term-spinner" aria-hidden="true" />
+              <span class="portty-link-banner-text">
+                {hold() === "checking"
+                  ? "Checking the connection…"
+                  : "Reconnecting… typing will be sent"}
+              </span>
+            </div>
+          )}
+        </Show>
+
         {/* The overflow sheet. Full-width rows with words, not glyphs - once an
             action costs a second tap it should at least stop being a rebus. */}
         <Show when={termMenu()}>
@@ -3093,9 +3414,27 @@ export default function App() {
         </Show>
 
         <Show when={transferStatus()}>
-          <div class="portty-transfer-status" onClick={() => setTransferStatus("")}>
-            {transferStatus()}
-          </div>
+          {/* A failure needs its whole sentence (the one-line bar cuts it off)
+              and its details; progress stays a quiet one-line bar. */}
+          <Show
+            when={transferProblem()}
+            fallback={
+              <div class="portty-transfer-status" onClick={() => setTransferStatus("")}>
+                {transferStatus()}
+              </div>
+            }
+          >
+            {(failure) => (
+              <div class="portty-transfer-problem">
+                <ErrorNote
+                  message={transferStatus()}
+                  detail={failure().detail}
+                  onDismiss={() => setTransferStatus("")}
+                  copy={clipboardWrite}
+                />
+              </div>
+            )}
+          </Show>
         </Show>
 
         <Show when={transferSheet()}>
@@ -3339,12 +3678,12 @@ export default function App() {
                     // asked for nothing. Prove it is the owner, same as enabling.
                     void promptBiometric("Confirm it's you to turn OFF app lock").then((ok) => {
                       if (!ok) {
-                        setStatus("app lock left ON - authentication failed");
+                        setStatus("App lock is still on - Portty couldn't confirm it's you.");
                         return;
                       }
                       setBioOn(false);
                       setBiometricPref(false);
-                      setStatus("app lock off");
+                      setStatus("App lock is off.");
                     });
                     return;
                   }
@@ -3354,12 +3693,12 @@ export default function App() {
                   // to prevent - so only persist it after a real unlock.
                   void promptBiometric("Confirm it's you to turn on app lock").then((ok) => {
                     if (!ok) {
-                      setStatus("app lock not enabled - authentication failed");
+                      setStatus("App lock wasn't turned on - Portty couldn't confirm it's you.");
                       return;
                     }
                     setBioOn(true);
                     setBiometricPref(true);
-                    setStatus("app lock on - Portty will ask on every return");
+                    setStatus("App lock is on. Portty will ask each time you come back.");
                   });
                 }}
               >
@@ -3377,13 +3716,53 @@ export default function App() {
                 aria-label="Disconnect from host; sessions keep running"
                 onClick={() => {
                   manualDisconnect = true;
-                  void portty.disconnect();
+                  // A link the core already lost sends no event to answer this.
+                  void portty.disconnect().then((dropped) => {
+                    if (!dropped) noticeLinkGone();
+                  });
                 }}
               >
                 <Icon name="disconnect" />
               </button>
             </Show>
+            {/* About Portty: versions, open-source licences, source code. */}
+            <button
+              class="portty-icon-btn"
+              title="About Portty"
+              aria-label="About Portty"
+              onClick={() => {
+                setHostMenuOpen(false);
+                setView("about");
+              }}
+            >
+              <Icon name="info" />
+            </button>
           </header>
+
+          {/* The words the dot can't say: why there is no connection and what to
+              do about it, or the last thing that failed here (with its details
+              for support). Toasts don't show on Home, so this is where it goes. */}
+          <Show
+            when={!connecting() && problem()}
+            fallback={
+              <Show when={homeState()}>
+                <div class="portty-home-status" role="status">
+                  <p class="portty-home-status__state">{homeState()}</p>
+                </div>
+              </Show>
+            }
+          >
+            {(current) => (
+              <div class="portty-home-status">
+                <ErrorNote
+                  message={current().message}
+                  detail={current().detail}
+                  onDismiss={() => setProblem(null)}
+                  copy={clipboardWrite}
+                />
+              </div>
+            )}
+          </Show>
 
           {/* As soon as one laptop is saved, selecting/switching it is a
               Home-screen operation - you pick the host right here instead of
@@ -3518,31 +3897,38 @@ export default function App() {
             <Show
               when={sessions().length > 0}
               fallback={
-                <div class="portty-empty">
-                  <div class="portty-empty-glyph">&gt;_</div>
-                  <p class="portty-empty-title">No sessions yet</p>
-                  <p class="portty-empty-sub">
-                    <Show
-                      when={paired()}
-                      fallback={
-                        <Show
-                          when={hostList().length > 0}
-                          fallback={
-                            <>
-                              On your computer, run <code>portty-host</code> - then tap
-                              “Connect to a host” and scan the QR it prints.
-                            </>
-                          }
-                        >
-                          Tap “Reconnect” to resume your last host, or “Connect to a host” to
-                          pair a new computer running <code>portty-host</code>.
-                        </Show>
-                      }
-                    >
-                      Start a shell or choose “Coding agent” below.
-                    </Show>
-                  </p>
-                </div>
+                // Blank until the saved hosts have been read. With none, this is
+                // a first run: the setup card stands in for the empty state and
+                // carries its pairing steps, after the install command they need.
+                <Show when={hostsLoaded()}>
+                  <Show
+                    when={showSetupHelp()}
+                    fallback={
+                      <div class="portty-empty">
+                        <div class="portty-empty-glyph">&gt;_</div>
+                        <p class="portty-empty-title">No sessions yet</p>
+                        <p class="portty-empty-sub">
+                          <Show
+                            when={paired()}
+                            fallback={
+                              <>
+                                Tap “Reconnect” to resume your last host, or “Connect to a host” to
+                                pair a new computer (run <code>portty pair</code> there).
+                              </>
+                            }
+                          >
+                            Start a shell or choose “Coding agent” below.
+                          </Show>
+                        </p>
+                      </div>
+                    }
+                  >
+                    <SetupHelp
+                      copy={clipboardWrite}
+                      onOpenGuide={() => openLink(SETUP_GUIDE_URL)}
+                    />
+                  </Show>
+                </Show>
               }
             >
               <div class="flex flex-col gap-2.5">
@@ -3659,7 +4045,15 @@ export default function App() {
             </Show>
           </div>
 
-          <div class="portty-footer">
+          <div
+            class="portty-footer"
+            classList={{
+              // Only once a folder browser (with its commit row) is open: the
+              // short provider list never overflows and keeps the footer padding.
+              "portty-footer--picker":
+                paired() && (showTerminalPicker() || (showAgentPicker() && !!pendingProvider())),
+            }}
+          >
             {/* Disconnected: resume-by-stored-token is a
                 one-tap primary action - recovery must NOT look like it needs a
                 fresh ticket+PIN pairing. "Connect to a host" (the pair form)
@@ -3925,6 +4319,14 @@ export default function App() {
         </div>
       </Show>
 
+      {/* ── ABOUT + OPEN-SOURCE LICENCES ── */}
+      <Show when={view() === "about"}>
+        <AboutScreen onBack={() => setView("list")} onLicences={() => setView("licences")} />
+      </Show>
+      <Show when={view() === "licences"}>
+        <LicencesScreen onBack={() => setView("about")} />
+      </Show>
+
       {/* ── PAIR ── */}
       <Show when={view() === "pair"}>
         <div class="flex h-full flex-col">
@@ -4050,9 +4452,10 @@ export default function App() {
                     </div>
                   </Show>
                   <p class="portty-hint">
-                    On your host run <code>portty-host</code>. Scan the QR, paste the ticket, or - if
-                    the ticket's too long to send by hand - type the NodeId + the six-word phrase it
-                    printed. Then confirm the code that appears, on the computer.
+                    On your computer, start <code>portty-host</code> and run{" "}
+                    <code>portty pair</code>. Scan the QR it shows, or paste its pairing ticket.
+                    Then check the code that appears here matches the one on your computer, and
+                    confirm it there.
                   </p>
                   <div class="portty-card flex flex-col gap-3">
                     {/* Labels stay visible after typing - placeholder-only
@@ -4060,9 +4463,10 @@ export default function App() {
                     <label class="portty-field">
                       Setup code from your computer
                       <textarea
+                        ref={ticketField}
                         class="portty-input portty-input--mono"
                         rows="2"
-                        placeholder="NodeId (64 hex) or portty1:…"
+                        placeholder="portty1:…"
                         value={ticket()}
                         onInput={(e) => setTicket(e.currentTarget.value)}
                         autocapitalize="off"
@@ -4139,11 +4543,36 @@ export default function App() {
                     </Show>
                   </div>
                   <Show when={scanError()}>
-                    <p class="text-xs" style={{ color: "var(--red)" }}>
-                      {scanError()}
-                    </p>
+                    {(message) => (
+                      <ErrorNote
+                        message={message()}
+                        action={{ label: "Paste code instead", run: pasteCodeInstead }}
+                        onDismiss={() => setScanError("")}
+                        reveal
+                      />
+                    )}
+                  </Show>
+                  {/* Why the last pair or reconnect failed, and what to do. The
+                      line below keeps saying where the connection stands. */}
+                  <Show when={problem()}>
+                    {(current) => (
+                      <ErrorNote
+                        message={current().message}
+                        detail={current().detail}
+                        onDismiss={() => setProblem(null)}
+                        copy={clipboardWrite}
+                      />
+                    )}
                   </Show>
                   <p class="portty-hint">{status()}</p>
+                  <div class="portty-pair-links">
+                    <button class="portty-link" onClick={() => openLink(SETUP_GUIDE_URL)}>
+                      Setup guide
+                    </button>
+                    <button class="portty-link" onClick={() => openLink(PRIVACY_POLICY_URL)}>
+                      Privacy policy
+                    </button>
+                  </div>
                 </>
               }
             >

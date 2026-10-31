@@ -14,6 +14,10 @@ pub const LAST_HOST_RECORD: &str = "portty-last-host.dat";
 /// existing postcard peer map while adding generation-bound revocation state.
 pub const PAIR_STATE_RECORD: &str = "portty-pair-state-v1.dat";
 pub const REVOCATIONS_RECORD: &str = "portty-revocations-v1.dat";
+/// Host only: each peer's token from one rotation ago, accepted for exactly one
+/// more reconnect so a phone that missed the last rotation is not locked out.
+/// Secret, like the peer map. See `PeerStore::commit_host_handshake`.
+pub const GRACE_RECORD: &str = "portty-grace-v1.dat";
 
 /// How durable a write must be before it may report success.
 ///

@@ -1,0 +1,89 @@
+/* About Portty and Open-source licences screens (About.tsx). Shared pieces -
+   header, card, hint - come from styles.css. */
+
+.portty-about-facts {
+  display: flex;
+  flex-direction: column;
+  gap: 0.6rem;
+  margin: 0;
+}
+.portty-about-fact {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 1rem;
+}
+.portty-about-fact dt {
+  font-size: 0.86rem;
+  color: var(--text-2);
+}
+.portty-about-fact dd {
+  margin: 0;
+  font-family: var(--mono);
+  font-size: 0.9rem;
+  color: var(--text-1);
+}
+.portty-about-note {
+  margin-top: 0.85rem;
+}
+
+/* Tappable rows inside one card, like a settings list. */
+.portty-about-links {
+  display: flex;
+  flex-direction: column;
+  padding: 0.3rem 0;
+}
+.portty-about-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+  /* 2.75rem ≈ Apple's 44pt touch-target floor, as .portty-icon-btn. */
+  min-height: 2.75rem;
+  padding: 0.55rem 1.1rem;
+  background: transparent;
+  border: none;
+  color: var(--text-1);
+  font-size: 0.92rem;
+  text-align: left;
+  -webkit-tap-highlight-color: transparent;
+  touch-action: manipulation;
+}
+.portty-about-row + .portty-about-row {
+  border-top: 1px solid var(--border);
+}
+.portty-about-row:active {
+  background: var(--surface-3);
+}
+.portty-about-row:focus-visible,
+.portty-licences:focus-visible {
+  outline: 2px solid var(--lime-deep);
+  outline-offset: -2px;
+}
+.portty-about-row .portty-icon {
+  color: var(--text-3);
+}
+
+.portty-licences {
+  padding: 1rem 1rem 1.5rem;
+}
+.portty-licences-block {
+  margin: 0;
+  font-family: var(--mono);
+  font-size: 0.72rem;
+  line-height: 1.5;
+  color: var(--text-2);
+  /* Licence files are drawn at 72-80 columns; a phone shows ~45. */
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  /* Someone may want to copy a licence; the app shell is otherwise unselectable. */
+  user-select: text;
+  -webkit-user-select: text;
+  /* ~400 KB of text: let the WebView skip laying out blocks that are off screen. */
+  content-visibility: auto;
+  contain-intrinsic-size: auto 40rem;
+}
+/* The blank line splitNotices() drops between blocks: one line of space. */
+.portty-licences-block + .portty-licences-block {
+  margin-top: 1.5em;
+}

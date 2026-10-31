@@ -33,7 +33,7 @@ Use only the explicit `tauri ios build` command in this document.
 - Xcode signed into the Apple developer account for team `YOURTEAMID`.
 - A valid Apple Development identity and App Store distribution access.
 - Rust stable, Cargo, Node.js, Corepack, and pnpm.
-- The Rust targets required by Tauri iOS.
+- The Rust targets required by Tauri iOS, and rustup's `llvm-tools` component.
 
 Install or confirm the command-line prerequisites:
 
@@ -42,11 +42,19 @@ xcode-select -p
 xcodebuild -version
 rustup show
 rustup target add aarch64-apple-ios aarch64-apple-ios-sim
+rustup component add llvm-tools
 corepack enable
 cd app
 pnpm install --frozen-lockfile
 cd ..
 ```
+
+`llvm-tools` provides `llvm-objcopy`. Under Xcode 27, swift-rs (which builds the Tauri
+plugins' Swift code) needs it to keep the plugins' entry points visible. Without it
+the iOS link fails with undefined `_init_plugin_*` symbols, and the build log says
+`llvm-objcopy not found`. After installing it, clear the cached iOS builds of those
+crates once: in `app/src-tauri`, run
+`cargo clean --release --target aarch64-apple-ios -p swift-rs -p tauri -p tauri-plugin-biometric -p tauri-plugin-clipboard-manager -p tauri-plugin-dialog -p tauri-plugin-notification -p tauri-plugin-opener -p tauri-plugin-fs`.
 
 Confirm that Xcode can see signing identities:
 
@@ -153,6 +161,17 @@ rg -n 'bundleVersion|CFBundleVersion|CFBundleShortVersionString' \
 
 ## 6. Validate and build the iOS archive
 
+First prove that this commit launches on a real iPhone. With the phone connected
+by cable, run the device check (the `ios-device-check` skill):
+
+```sh
+python3 .claude/skills/ios-device-check/scripts/iosdev.py run
+```
+
+It builds a development-signed copy, installs it, and fails if the app dies or the
+phone records a crash. Do not continue to the archive unless it passes: a new SDK can
+break launch with every unit test still green, as Xcode 27 did to build 1.28.
+
 Build the frontend first and run the mobile release checks:
 
 ```sh
@@ -257,6 +276,7 @@ perform the phone smoke test.
 - [ ] Installed hashes match `target/release/portty` and `portty-host`.
 - [ ] No Portty macOS `.app` exists in `/Applications` or `~/Applications`.
 - [ ] Workspace, frontend, and iOS release tests passed.
+- [ ] The device check passed on a physical iPhone for this commit.
 - [ ] Marketing version and build number are correct.
 - [ ] Archive platform is `iPhoneOS` and architecture is `arm64`.
 - [ ] IPA contains no `libapp.a` or desktop application.

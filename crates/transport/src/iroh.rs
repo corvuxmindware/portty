@@ -4,8 +4,9 @@
 //!   - **ALPN** `corvux/sync/1` → **`portty/sync/1`**.
 //!   - **Ticket scheme** `corvux1:` → **`portty1:`**.
 //!   - **Dropped the mDNS/LAN `address_lookup`** param from `build_endpoint`
-//!     (Portty LAN discovery is a later step); the N0 preset's DNS discovery is
-//!     kept so a peer holding just a NodeId can still resolve.
+//!     (Portty LAN discovery is a later step); n0's pkarr discovery is kept so
+//!     a peer holding just a NodeId can still resolve - over HTTPS only, see
+//!     `build_endpoint`.
 //!   - `Transport<M>` is generic over the message type - impl below covers every
 //!     postcard `M` (handshake messages AND post-handshake `SealedEnvelope`).
 //!
@@ -14,6 +15,7 @@
 //! so we seed iroh's `SecretKey` from the existing keypair (one key on disk).
 
 use async_trait::async_trait;
+use iroh::address_lookup::{PkarrPublisher, PkarrResolver};
 use iroh::endpoint::presets;
 use iroh::endpoint::{Connection, RecvStream, SendStream};
 use iroh::{Endpoint, EndpointAddr as NodeAddr, EndpointId as NodeId, RelayMode, SecretKey};
@@ -119,6 +121,10 @@ pub struct HandshakeOutcome {
     /// Whether this session proved an existing rotating token. False means a
     /// first/manual pair and therefore authorizes a new pair generation.
     pub resumed: bool,
+    /// Server side: the peer resumed with its PREVIOUS token (it missed the last
+    /// rotation). Commit with `ResumedWith::PreviousToken` so that token is used
+    /// up. Always false on the client.
+    pub previous_token: bool,
     /// Candidate generation material derived from this session. Callers retain
     /// the existing durable material on resume and install this on a fresh pair.
     pub pair_id: PairId,
@@ -228,6 +234,26 @@ impl IrohTransport {
             },
         )
     }
+
+    /// Close after a final message, so that message actually arrives.
+    ///
+    /// Dropping the transport closes the QUIC connection at once, and a close can
+    /// overtake stream data still in flight: the peer then reports "connection
+    /// lost" instead of reading the refusal we just sent. QUIC's rule is that only
+    /// the side that RECEIVES the last data knows it arrived, so that side should
+    /// hang up. This ends our send stream (the peer reads a clean end of stream
+    /// after the message), waits up to `linger` for the peer to close, and only
+    /// then closes from here.
+    ///
+    /// Bounded both ways for an unauthenticated peer: incoming data is discarded
+    /// and the peer told to stop sending, so a lingering connection holds no
+    /// buffered input, and a peer that never hangs up costs at most `linger`.
+    pub async fn finish_and_close(mut self, linger: std::time::Duration) {
+        let _ = self.recv.stop(0u32.into());
+        let _ = self.send.finish();
+        let _ = tokio::time::timeout(linger, self.connection.closed()).await;
+        self.connection.close(0u32.into(), b"portty: done");
+    }
 }
 
 /// Write half of an iroh transport. Carries raw framed bytes (postcard payload).
@@ -296,6 +322,13 @@ where
 /// `relay_mode`: `Default` (Number0 public relays), `Custom` (self-hosted), or
 /// `Disabled` (LAN/local only - used by tests). Bounded environment tuning
 /// controls keepalive, dead-peer detection, and BDP-sized flow-control windows.
+///
+/// Discovery is `presets::N0` minus its `DnsAddressLookup`: publish our home
+/// relay URL to n0's pkarr server, and look peers up there over HTTPS. The DNS
+/// lookup the preset adds asks the system resolver for `_iroh.<NodeId>` in
+/// plain text on every connect, so whoever runs the network's DNS could follow
+/// one computer's ID across networks - for a record the HTTPS lookup already
+/// fetches from the same server.
 pub async fn build_endpoint(
     identity: &Identity,
     relay_mode: RelayMode,
@@ -314,7 +347,9 @@ pub async fn build_endpoint(
         .receive_window((tuning.connection_window_bytes as u32).into())
         .send_window(tuning.send_window_bytes)
         .build();
-    Endpoint::builder(presets::N0)
+    Endpoint::builder(presets::Minimal)
+        .address_lookup(PkarrPublisher::n0_dns())
+        .address_lookup(PkarrResolver::n0_dns())
         .secret_key(secret)
         .alpns(vec![SYNC_ALPN.to_vec()])
         .relay_mode(relay_mode)
@@ -617,6 +652,7 @@ where
                     peer_display_name,
                     reconnect_token,
                     resumed,
+                    previous_token: false,
                     pair_id,
                     pair_event_key,
                     enrollment_epoch: None,
@@ -654,6 +690,12 @@ where
 ///
 /// On success the pairing is authenticated but NOT yet acknowledged to the client
 /// - call [`confirm_server_handshake`] once it is durably committed.
+///
+/// Every refusal sends the peer one `PairingFailed` before returning the error,
+/// including a peer whose frames carry a protocol version this build cannot read
+/// (see [`ServerHandshake::reject_unreadable_version`]). Nothing more is sent
+/// after it, so a caller that wants the reply delivered should close with
+/// [`IrohTransport::finish_and_close`] rather than just dropping the transport.
 pub async fn run_server_handshake<T>(
     transport: &mut T,
     server: &mut ServerHandshake,
@@ -662,7 +704,22 @@ where
     T: Transport<HandshakeMessage>,
 {
     loop {
-        let msg = transport.recv().await?;
+        let msg = match transport.recv().await {
+            Ok(msg) => msg,
+            // A peer on another wire generation. The frame layer read its frame
+            // whole before refusing it, so the stream is still in step and one
+            // reply can go back - framed in OUR version, which is what lets the
+            // peer name the older side instead of reporting a lost connection.
+            // Best effort: the peer may already be gone, and the version error
+            // is what the caller needs either way.
+            Err(error @ TransportError::UnsupportedProtocolVersion { .. }) => {
+                tracing::warn!("host rejected pairing: reason=UnsupportedVersion ({error})");
+                let reply = server.reject_unreadable_version();
+                let _ = transport.send(&reply).await;
+                return Err(error.into());
+            }
+            Err(error) => return Err(error.into()),
+        };
         match server.step(msg)? {
             Outcome::Send(m) => {
                 if let HandshakeMessage::PairingFailed { reason } = &m {
@@ -682,6 +739,7 @@ where
                 peer_device_id,
                 peer_display_name,
                 resumed,
+                previous_token,
                 enrollment_epoch,
             } => {
                 // Deliberately does NOT send PairingOk. The caller must first claim
@@ -704,6 +762,7 @@ where
                     peer_display_name,
                     reconnect_token,
                     resumed,
+                    previous_token,
                     pair_id,
                     pair_event_key,
                     enrollment_epoch,
@@ -720,7 +779,112 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::error::SyncError;
+    use crate::handshake::PairingFailure;
     use ed25519_dalek::SigningKey;
+
+    /// An in-memory `Transport`, framed exactly as `IrohTransport` frames: every
+    /// frame stamped with our `PROTOCOL_VERSION`, every incoming one
+    /// version-checked before it is decoded. Lets the handshake runners be driven
+    /// without a network.
+    struct PipeTransport(tokio::io::DuplexStream);
+
+    #[async_trait]
+    impl<M> Transport<M> for PipeTransport
+    where
+        M: serde::Serialize + serde::de::DeserializeOwned + Send + Sync,
+    {
+        async fn send(&mut self, msg: &M) -> Result<(), TransportError> {
+            let bytes = postcard::to_allocvec(msg).expect("test messages encode");
+            write_frame(&mut self.0, PROTOCOL_VERSION, &bytes).await
+        }
+
+        async fn recv(&mut self) -> Result<M, TransportError> {
+            let (version, bytes) = read_frame(&mut self.0).await?;
+            validate_protocol_version(version)?;
+            postcard::from_bytes(&bytes).map_err(|e| TransportError::Iroh(format!("decode: {e}")))
+        }
+
+        async fn close(&mut self) -> Result<(), TransportError> {
+            Ok(())
+        }
+    }
+
+    /// A peer on another wire generation - newer or older - gets exactly one
+    /// frame back: stamped with OUR version and carrying `UnsupportedVersion`.
+    /// Its own frame layer then refuses that frame and reports our version as
+    /// `found`, which is how the phone names the older side. Before, the host
+    /// dropped the connection inside `recv` and the phone saw "connection lost".
+    #[tokio::test]
+    async fn a_frame_on_another_protocol_version_is_answered_once_in_ours() {
+        for theirs in [PROTOCOL_VERSION + 1, PROTOCOL_VERSION - 1] {
+            let (host_side, mut peer) = tokio::io::duplex(4096);
+            let mut transport = PipeTransport(host_side);
+            let mut server = ServerHandshake::new(DeviceId([2; 16]), "host".into());
+            let hello = HandshakeMessage::Hello {
+                device_id: [1; 16],
+                protocol_version: theirs,
+                display_name: "phone".into(),
+                client_eph_pub: [9; 32],
+            };
+            write_frame(&mut peer, theirs, &postcard::to_allocvec(&hello).unwrap())
+                .await
+                .unwrap();
+
+            let error = run_server_handshake(&mut transport, &mut server)
+                .await
+                .err()
+                .expect("a peer on another version must be refused");
+            assert!(
+                matches!(
+                    error,
+                    SyncError::Transport(TransportError::UnsupportedProtocolVersion {
+                        expected: PROTOCOL_VERSION,
+                        found,
+                    }) if found == theirs
+                ),
+                "{error}"
+            );
+            drop(transport);
+
+            let (version, payload) = read_frame(&mut peer).await.unwrap();
+            assert_eq!(version, PROTOCOL_VERSION, "the reply speaks our version");
+            assert!(matches!(
+                postcard::from_bytes(&payload).unwrap(),
+                HandshakeMessage::PairingFailed {
+                    reason: PairingFailure::UnsupportedVersion
+                }
+            ));
+            // One reply and nothing after it: the next read is the end of stream.
+            assert!(matches!(
+                read_frame(&mut peer).await,
+                Err(TransportError::Closed)
+            ));
+        }
+    }
+
+    /// The other half of the contract: a peer on OUR version pairs exactly as
+    /// before - the new branch only ever fires on a refused frame.
+    #[tokio::test]
+    async fn a_peer_on_our_protocol_version_still_pairs() {
+        let secret = || crate::crypto::pairing::PairingSecret::from_ticket_bytes([0x42; 16]);
+        let (host_side, phone_side) = tokio::io::duplex(64 * 1024);
+        let mut host = PipeTransport(host_side);
+        let mut phone = PipeTransport(phone_side);
+        let mut server = ServerHandshake::new(DeviceId([2; 16]), "host".into())
+            .with_unwindowed_pairing_secrets([secret()]);
+        let mut client = ClientHandshake::first_pair(DeviceId([1; 16]), "phone".into(), secret());
+
+        let host_task = async {
+            let outcome = run_server_handshake(&mut host, &mut server).await?;
+            confirm_server_handshake(&mut host, &server).await?;
+            Ok::<_, SyncError>(outcome)
+        };
+        let (host_outcome, phone_outcome) =
+            tokio::join!(host_task, run_client_handshake(&mut phone, &mut client));
+        assert_eq!(host_outcome.unwrap().peer_device_id, DeviceId([1; 16]));
+        assert_eq!(phone_outcome.unwrap().peer_device_id, DeviceId([2; 16]));
+    }
 
     #[test]
     fn node_id_to_device_id_matches_identity_derivation() {

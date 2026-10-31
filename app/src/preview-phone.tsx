@@ -115,6 +115,7 @@ const savedHosts: SavedHost[] = [
 
 const disconnectedAtBoot = new Set([
   "home-disconnected",
+  "home-first-run",
   "pair",
   "pair-node-id",
   "pair-confirm",
@@ -123,6 +124,7 @@ const disconnectedAtBoot = new Set([
 const emptySessionScenarios = new Set([
   "home-empty",
   "home-disconnected",
+  "home-first-run",
   "pair",
   "pair-node-id",
   "pair-confirm",
@@ -132,6 +134,11 @@ type OutputChannel = { onmessage: (message: ArrayBuffer) => void };
 let channel: OutputChannel | null = null;
 let reconnectCalls = 0;
 let emittedList = false;
+// `terminal-session-ended`: the host restarted under an open shell, so the
+// reconnect lands on a host with nothing running. The driver lets the reconnect
+// finish only after it has typed into the dead link.
+let hostRestarted = false;
+let finishRestart: (() => void) | null = null;
 
 const later = (work: () => void, delay = 25) => window.setTimeout(work, delay);
 const emitEvent = (event: string, payload: unknown, delay = 0) => {
@@ -151,7 +158,7 @@ const crowdedSessions: SessionInfo[] = [
 ];
 
 function currentSessions(): SessionInfo[] {
-  if (emptySessionScenarios.has(scenario)) return [];
+  if (emptySessionScenarios.has(scenario) || hostRestarted) return [];
   return scenario === "home-approvals-crowded" ? crowdedSessions : sessions;
 }
 
@@ -499,6 +506,55 @@ function pendingPermissions(): AgentPermission[] {
   }
 }
 
+/* Error states. The core's pair/reconnect commands reject with
+   `{ kind, message, detail }` (src-tauri/src/connect_error.rs); these copy its
+   words so the workbench shows exactly what a phone would. */
+const OLD_COMPUTER = {
+  kind: "maybe_old_host",
+  message:
+    "Couldn't finish connecting. Your computer may have an older version of Portty. Update the Portty program on your computer to 0.1.3 or newer (check with `portty --version`), then try again.",
+  detail: "handshake before any reply: transport: io: connection lost",
+};
+const CODE_EXPIRED = {
+  kind: "code_expired",
+  message:
+    "This pairing code has expired or was already used. Run `portty pair` on your computer again and scan the new QR code.",
+  detail: "handshake after a reply: protocol: pairing failed: PairingClosed",
+};
+
+/** What a command fails with in an error state, or null to answer normally. */
+function previewFailure(command: string): unknown {
+  if (scenario === "home-connect-error" && command === "reconnect") return OLD_COMPUTER;
+  if (scenario === "pair-error" || scenario === "pair-camera-denied") {
+    if (command === "reconnect") return new Error("preview starts disconnected");
+    if (command === "pair") return CODE_EXPIRED;
+  }
+  // The host's own refusal, path and all - the note must not repeat the path.
+  if (scenario === "terminal-transfer-error" && command === "probe_download") {
+    return "cannot open /home/sam/notes/plan.txt: No such file or directory (os error 2)";
+  }
+  return null;
+}
+
+/* No real camera in the workbench: refuse it the way a phone whose owner said
+   no does, and wear the chosen device's user agent so the message names that
+   platform's settings screen. */
+if (scenario === "pair-camera-denied") {
+  Object.defineProperty(navigator, "mediaDevices", {
+    configurable: true,
+    value: {
+      getUserMedia: () => Promise.reject(new DOMException("Permission denied", "NotAllowedError")),
+      enumerateDevices: () => Promise.resolve([]),
+    },
+  });
+  const userAgent = device.startsWith("iphone")
+    ? "Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15"
+    : device === "android"
+      ? "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36"
+      : null;
+  if (userAgent) Object.defineProperty(navigator, "userAgent", { configurable: true, get: () => userAgent });
+}
+
 function attach(id: number): void {
   if (id === AGENT_ID) {
     emitEvent("portty://agent-snapshot", { id, events: agentEvents() }, 30);
@@ -513,6 +569,8 @@ function attach(id: number): void {
 mockIPC(
   (command, payload) => {
     const args = (payload ?? {}) as Record<string, unknown>;
+    const failure = previewFailure(command);
+    if (failure) throw failure;
     switch (command) {
       case "biometric_platform_enforced":
         return true;
@@ -525,6 +583,8 @@ mockIPC(
       case "consume_push_wake":
         return null;
       case "list_hosts":
+        // A brand-new install: nothing paired, so Home shows the setup card.
+        if (scenario === "home-first-run") return [];
         // The first-run case gets a host with NO default, so the "nothing starred
         // yet" sheet is reviewable instead of only the already-configured one.
         return scenario === "home-terminal-folder-first-star"
@@ -535,6 +595,20 @@ mockIPC(
         channel = args.onOutput as unknown as OutputChannel;
         if (disconnectedAtBoot.has(scenario) && reconnectCalls === 1) {
           throw new Error("preview starts disconnected");
+        }
+        // The link dropped under an open shell and the host is not back yet:
+        // the auto-reconnect never finishes, so its banner stays up.
+        if (scenario === "terminal-reconnecting" && reconnectCalls > 1) {
+          return new Promise<undefined>(() => {});
+        }
+        if (scenario === "terminal-session-ended" && reconnectCalls > 1) {
+          return new Promise<undefined>((resolve) => {
+            finishRestart = () => {
+              hostRestarted = true;
+              sendSessionList();
+              resolve(undefined);
+            };
+          });
         }
         sendSessionList();
         return undefined;
@@ -577,7 +651,7 @@ mockIPC(
         return undefined;
       case "disconnect":
         emitEvent("portty://disconnected", null, 15);
-        return undefined;
+        return true;
       case "kill":
         emitEvent("portty://removed", args.id, 15);
         return undefined;
@@ -718,6 +792,7 @@ mockIPC(
       case "download_file":
       case "upload_file":
         return 1;
+      case "probe_download":
       case "plugin:dialog|open":
       case "plugin:dialog|save":
         return null;
@@ -725,6 +800,11 @@ mockIPC(
         return "cargo test --workspace";
       case "plugin:clipboard-manager|write_text":
         return undefined;
+      // The About screen: Tauri's app version and the core's protocol number.
+      case "plugin:app|version":
+        return "0.1.3";
+      case "app_info":
+        return { protocol_version: 11 };
       default:
         throw new Error(`Unhandled preview IPC command: ${command}`);
     }
@@ -891,6 +971,45 @@ async function driveScenario(): Promise<void> {
     return;
   }
 
+  // Error states: each waits for the note itself, so a message that stops
+  // rendering fails the state loudly.
+  if (scenario === "home-connect-error") {
+    await waitFor(() => document.querySelector(".portty-home-status .portty-note"));
+    return;
+  }
+  if (scenario === "pair-error" || scenario === "pair-camera-denied") {
+    await clickText("button", "Connect to a host");
+    await waitFor(() => document.querySelector(".portty-card"));
+    if (scenario === "pair-error") {
+      const ticket = await waitFor(() =>
+        document.querySelector<HTMLTextAreaElement>(".portty-field textarea"),
+      );
+      ticket.value = "portty1:eyJuaWQiOiJwcmV2aWV3In0";
+      ticket.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "insertText", data: "p" }));
+      await clickText(".portty-btn-primary", "Pair");
+    } else {
+      await clickText("button", "Scan QR");
+    }
+    await waitFor(() => document.querySelector(".portty-note"));
+    return;
+  }
+  if (scenario === "terminal-transfer-error") {
+    await openTerminal();
+    (
+      await waitFor(() =>
+        document.querySelector<HTMLButtonElement>('[aria-label="Download a file from the host"]'),
+      )
+    ).click();
+    const path = await waitFor(() =>
+      document.querySelector<HTMLInputElement>(".portty-transfer-sheet input[type=text]"),
+    );
+    path.value = "~/notes/plan.txt";
+    path.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "insertText" }));
+    await clickText(".portty-transfer-sheet .portty-btn-primary", "Download");
+    await waitFor(() => document.querySelector(".portty-transfer-problem .portty-note"));
+    return;
+  }
+
   switch (scenario) {
     case "home-connected":
       await waitFor(() =>
@@ -904,6 +1023,11 @@ async function driveScenario(): Promise<void> {
       break;
     case "home-disconnected":
       await waitFor(() => byText("button", "Reconnect"));
+      break;
+    // Waits for the card's command line: the card only renders once the saved
+    // hosts have been read and found empty.
+    case "home-first-run":
+      await waitFor(() => document.querySelector(".portty-setup-command code"));
       break;
     case "home-host-menu":
       (await waitFor(() => document.querySelector<HTMLButtonElement>('[aria-label="Switch host"]'))).click();
@@ -1006,6 +1130,36 @@ async function driveScenario(): Promise<void> {
       await openTerminal();
       await waitFor(() => document.querySelector(".portty-cmdbar-hint"));
       break;
+    // A silent drop while a shell is open. Waits for the banner itself, so the
+    // state fails loudly if the drop ever stops showing inside the session.
+    case "terminal-reconnecting":
+      await openTerminal();
+      emitEvent("portty://disconnected", null);
+      await waitFor(() => document.querySelector(".portty-link-banner"));
+      break;
+    // The host restarted while a shell was open and a command was typed into
+    // the outage. One message must say the session ended and the typing went
+    // nowhere, on the list - never "session restored". Waits for that exact
+    // copy on the list, so the state fails if either half regresses.
+    case "terminal-session-ended": {
+      await openTerminal();
+      emitEvent("portty://disconnected", null);
+      await waitFor(() => document.querySelector(".portty-link-banner"));
+      const command = await waitFor(() =>
+        document.querySelector<HTMLInputElement>(".portty-cmdbar-input"),
+      );
+      command.value = "echo held";
+      command.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "insertText" }));
+      (
+        await waitFor(() =>
+          document.querySelector<HTMLButtonElement>(".portty-cmdbar-send:not(:disabled)"),
+        )
+      ).click();
+      finishRestart?.();
+      await waitFor(() => byText(".portty-reconnect-toast", "typing not sent"));
+      await waitFor(() => document.querySelector(".portty-empty"));
+      break;
+    }
     case "terminal-keys":
       await openTerminal();
       (await waitFor(() => document.querySelector<HTMLButtonElement>('[aria-label="Show more keys"]'))).click();
@@ -1087,6 +1241,21 @@ async function driveScenario(): Promise<void> {
       await waitFor(() => document.querySelector(".portty-agent-command-menu"));
       break;
     }
+    // Opened only once the home screen has connected, so the "paired" status
+    // toast never lands on top of it. Waits for the version to arrive, so the
+    // state fails if the IPC answers stop reaching the screen.
+    case "about":
+      await waitFor(() => document.querySelector(".portty-session-card"));
+      (await waitFor(() => document.querySelector<HTMLButtonElement>('[aria-label="About Portty"]'))).click();
+      await waitFor(() => byText(".portty-about-version", "0.1.3"));
+      break;
+    // Waits for the licence text itself, so it fails if the bundled file stops loading.
+    case "about-licences":
+      await waitFor(() => document.querySelector(".portty-session-card"));
+      (await waitFor(() => document.querySelector<HTMLButtonElement>('[aria-label="About Portty"]'))).click();
+      await clickText(".portty-about-row", "Open-source licences");
+      await waitFor(() => byText(".portty-licences-block", "OPEN-SOURCE LICENCES"));
+      break;
     default:
       if (!emittedList) sendSessionList();
   }

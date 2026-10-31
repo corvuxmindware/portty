@@ -2,8 +2,12 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <!--
   Portty does not track users or collect terminal/session data for the
-  developer. Required-reason API declarations cover framework access to the
-  app's own files and preferences. Revisit this manifest when adding SDKs.
+  developer. The one collected data type is the random device ID that its
+  connection servers (relay and lookup, run by n0) can see - declared the same
+  way as the App Store Connect App Privacy answers: Device ID, App
+  Functionality, not linked to identity, not used for tracking. Required-reason
+  API declarations cover framework access to the app's own files and
+  preferences. Revisit this manifest when adding SDKs.
 -->
 <plist version="1.0">
 <dict>
@@ -12,7 +16,20 @@
 	<key>NSPrivacyTrackingDomains</key>
 	<array/>
 	<key>NSPrivacyCollectedDataTypes</key>
-	<array/>
+	<array>
+		<dict>
+			<key>NSPrivacyCollectedDataType</key>
+			<string>NSPrivacyCollectedDataTypeDeviceID</string>
+			<key>NSPrivacyCollectedDataTypeLinked</key>
+			<false/>
+			<key>NSPrivacyCollectedDataTypeTracking</key>
+			<false/>
+			<key>NSPrivacyCollectedDataTypePurposes</key>
+			<array>
+				<string>NSPrivacyCollectedDataTypePurposeAppFunctionality</string>
+			</array>
+		</dict>
+	</array>
 	<key>NSPrivacyAccessedAPITypes</key>
 	<array>
 		<dict>

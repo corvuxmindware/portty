@@ -223,6 +223,10 @@ pub enum Outcome {
         /// True only when the resumption token authenticated this handshake.
         /// A token→PIN manual repair is a fresh pair, not a resume.
         resumed: bool,
+        /// Server side: the resume was proved by the peer's PREVIOUS token, so it
+        /// missed the last rotation. The caller must use that token up - see
+        /// `PeerStore::commit_host_handshake`. Always false on the client.
+        previous_token: bool,
         /// For a FIRST pair, the enrollment opportunity this proof was verified
         /// under. The caller must claim it with
         /// [`crate::crypto::pairing::PairingState::consume_first_pair`] and
@@ -441,6 +445,9 @@ impl ClientHandshake {
                     peer_device_id: DeviceId(device_id),
                     peer_display_name: display_name,
                     resumed: self.is_resume(),
+                    // The client proves the one token it holds; only the host
+                    // can tell it was the previous one.
+                    previous_token: false,
                     // Client side: enrollment gating is the host's business.
                     enrollment_epoch: None,
                 })
@@ -471,6 +478,9 @@ pub enum ServerState {
         /// SEC-2: `Some(token)` if we're authenticating this connection by a
         /// stored resumption token (reconnect); `None` = verify the PIN.
         auth_token: Option<ResumptionToken>,
+        /// The peer's previous token, tried only when `auth_token` does not
+        /// verify. `None` unless `auth_token` is `Some`.
+        grace_token: Option<ResumptionToken>,
         /// The enrollment opportunity this FIRST-PAIR challenge was gated under,
         /// re-checked when the proof arrives so a challenge issued before another
         /// client consumed the window cannot still enrol. `None` for a reconnect
@@ -528,6 +538,11 @@ pub struct ServerHandshake {
     /// connection by the token (reconnect) instead of the human PIN. Pre-loaded
     /// by the accept path from the persisted peer store.
     resumption_tokens: HashMap<DeviceId, ResumptionToken>,
+    /// Each peer's token from one rotation ago, accepted when the current one
+    /// does not verify - a phone that missed the last rotation. Consulted only
+    /// for a peer we also hold a current token for. See
+    /// `PeerStore::commit_host_handshake`, which uses it up.
+    grace_tokens: HashMap<DeviceId, ResumptionToken>,
     /// DeviceId derived from the authenticated iroh NodeId. This binds the
     /// self-asserted Hello identity before any revocation state is revealed.
     authenticated_device: Option<DeviceId>,
@@ -547,6 +562,7 @@ impl ServerHandshake {
             pairing_secrets: Vec::new(),
             enrollment_exempt_device: None,
             resumption_tokens: HashMap::new(),
+            grace_tokens: HashMap::new(),
             authenticated_device: None,
             authenticated_device_revoked: false,
         }
@@ -645,6 +661,19 @@ impl ServerHandshake {
         self
     }
 
+    /// Supply each peer's previous token (from `PeerStore::grace_tokens`) so a
+    /// phone that missed the last rotation can still resume, once.
+    pub fn with_grace_tokens<T>(mut self, tokens: HashMap<DeviceId, T>) -> Self
+    where
+        T: Into<ResumptionToken>,
+    {
+        self.grace_tokens = tokens
+            .into_iter()
+            .map(|(device, token)| (device, token.into()))
+            .collect();
+        self
+    }
+
     /// Bind the Hello identity to the peer identity authenticated by QUIC.
     pub fn with_authenticated_device(mut self, device: DeviceId, revoked: bool) -> Self {
         self.authenticated_device = Some(device);
@@ -660,6 +689,29 @@ impl ServerHandshake {
     /// The server's own display name - sent in `PairingOk`.
     pub fn own_display_name(&self) -> &str {
         &self.display_name
+    }
+
+    /// Refuse a peer whose FRAMES carry a protocol version this build cannot
+    /// read, and return the one reply it gets.
+    ///
+    /// The frame layer rejects such a frame before the FSM ever sees it, so the
+    /// Hello check in [`Self::step`] cannot answer it. Without a reply the peer
+    /// only saw the connection drop, and the phone could say nothing better than
+    /// "connection lost". The caller sends this reply framed with OUR
+    /// `PROTOCOL_VERSION`: the peer's frame layer then refuses it in turn and
+    /// reports `UnsupportedProtocolVersion { found: <our version> }`, which tells
+    /// it which side is older. A peer that does read our version decodes the
+    /// payload instead and gets the same `UnsupportedVersion` the Hello check
+    /// sends.
+    ///
+    /// Moves the FSM to `Failed`, so nothing more can be stepped on this
+    /// connection. The reply carries no secret and costs nothing to build, and
+    /// the peer had to finish a QUIC handshake and send a whole frame to get it.
+    pub fn reject_unreadable_version(&mut self) -> HandshakeMessage {
+        self.state = ServerState::Failed;
+        HandshakeMessage::PairingFailed {
+            reason: PairingFailure::UnsupportedVersion,
+        }
     }
 
     pub fn step(&mut self, incoming: HandshakeMessage) -> SyncResult<Outcome> {
@@ -769,6 +821,11 @@ impl ServerHandshake {
                 // a reconnect - authenticate + derive the session from the token
                 // (plus the fresh ECDH) instead of the human PIN.
                 let auth_token = self.resumption_tokens.get(&DeviceId(device_id)).cloned();
+                // Only a peer we hold a current token for may fall back to its
+                // previous one; a first pair never reaches it.
+                let grace_token = auth_token
+                    .as_ref()
+                    .and_then(|_| self.grace_tokens.get(&DeviceId(device_id)).cloned());
                 let session = match auth_token.as_ref() {
                     Some(tok) => derive_session_from_key(tok.as_bytes(), &nonce, &ecdh)?,
                     None => {
@@ -793,6 +850,7 @@ impl ServerHandshake {
                     peer_device_id: DeviceId(device_id),
                     peer_display_name: display_name,
                     auth_token,
+                    grace_token,
                     enrollment_epoch,
                     ecdh,
                     transcript,
@@ -807,6 +865,7 @@ impl ServerHandshake {
                     nonce,
                     transcript,
                     auth_token,
+                    grace_token,
                     enrollment_epoch,
                     ..
                 },
@@ -815,6 +874,7 @@ impl ServerHandshake {
                 let nonce = *nonce;
                 let transcript = transcript.clone();
                 let auth_token = auth_token.clone();
+                let grace_token = grace_token.clone();
                 let enrollment_epoch = *enrollment_epoch;
                 let claimed = crate::crypto::pairing::Proof(proof);
                 // Verify a reconnect token first. Otherwise accept whichever
@@ -825,17 +885,23 @@ impl ServerHandshake {
                 let token_verified = auth_token.as_ref().is_some_and(|tok| {
                     verify_proof_with_key(tok.as_bytes(), &nonce, &transcript, &claimed).is_ok()
                 });
+                // Then the previous token: the phone missed the last rotation.
+                // Same proof, same transcript binding - only the key differs.
+                let grace_verified = !token_verified
+                    && grace_token.as_ref().is_some_and(|tok| {
+                        verify_proof_with_key(tok.as_bytes(), &nonce, &transcript, &claimed).is_ok()
+                    });
                 // No armed secret → no candidates → nothing can verify. That is
                 // the intended fail-closed shape: an unarmed host must never
                 // accept a first pair.
                 let fp_keys: Vec<_> = self.pairing_secrets.iter().map(first_pair_key).collect();
-                let matched_first_pair = (!token_verified).then(|| {
+                let matched_first_pair = (!token_verified && !grace_verified).then(|| {
                     fp_keys.iter().position(|key| {
                         verify_proof_with_key(key, &nonce, &transcript, &claimed).is_ok()
                     })
                 });
                 let matched_first_pair = matched_first_pair.flatten();
-                if token_verified || matched_first_pair.is_some() {
+                if token_verified || grace_verified || matched_first_pair.is_some() {
                     if let Ok(mut rl) = self.rate_limiter.lock() {
                         rl.record_success(&self.rate_limit_key);
                     }
@@ -853,11 +919,17 @@ impl ServerHandshake {
                             ecdh,
                             ..
                         } => {
-                            let s_secret = match matched_first_pair {
-                                Some(index) => {
+                            // The session at challenge time was derived from the
+                            // current token; re-derive it from whichever key the
+                            // client actually proved, as the client did.
+                            let s_secret = match (matched_first_pair, &grace_token) {
+                                (Some(index), _) => {
                                     derive_session_from_key(&fp_keys[index], &nonce, &ecdh)?
                                 }
-                                None => session,
+                                (None, Some(grace)) if grace_verified => {
+                                    derive_session_from_key(grace.as_bytes(), &nonce, &ecdh)?
+                                }
+                                (None, _) => session,
                             };
                             (s_secret, peer_device_id, peer_display_name)
                         }
@@ -867,7 +939,8 @@ impl ServerHandshake {
                         session,
                         peer_device_id,
                         peer_display_name,
-                        resumed: token_verified,
+                        resumed: token_verified || grace_verified,
+                        previous_token: grace_verified,
                         // Only a first pair has an opportunity to claim.
                         enrollment_epoch: auth_token
                             .is_none()
@@ -1134,6 +1207,31 @@ mod tests {
         }
     }
 
+    /// A peer whose frames the frame layer refused gets exactly the reply the
+    /// Hello check would have sent, and the handshake is over: a later, perfectly
+    /// valid Hello on the same connection must not be answered with a challenge.
+    ///
+    /// The payload bytes are pinned because a peer that CAN read our frame
+    /// version decodes them, and both enums are append-only: `PairingFailed` is
+    /// variant 4 and `UnsupportedVersion` is reason 2, in every released build.
+    #[test]
+    fn an_unreadable_version_gets_one_reply_and_ends_the_handshake() {
+        let mut server =
+            ServerHandshake::new(dev(2), "b".into()).with_unwindowed_pairing_secrets([secret()]);
+        let reply = server.reject_unreadable_version();
+        match &reply {
+            HandshakeMessage::PairingFailed { reason } => {
+                assert_eq!(*reason, PairingFailure::UnsupportedVersion);
+            }
+            other => panic!("expected PairingFailed, got {:?}", variant_name(other)),
+        }
+        assert_eq!(postcard::to_allocvec(&reply).unwrap(), vec![4, 2]);
+
+        let mut client = ClientHandshake::first_pair(dev(1), "phone".into(), secret());
+        let err = server.step(client.start()).unwrap_err();
+        assert!(err.to_string().contains("Failed"), "{err}");
+    }
+
     #[test]
     fn unexpected_message_errors() {
         let mut server =
@@ -1249,6 +1347,119 @@ mod tests {
                 assert_eq!(reason, PairingFailure::WrongPin);
             }
             o => panic!("a wrong token must be rejected, got {o:?}"),
+        }
+    }
+
+    // ── Grace token: a phone that missed one rotation ──────────────────
+
+    /// One reconnect where the phone proves `client_token` to a host holding
+    /// `current` and, optionally, a previous token. On success: whether the host
+    /// saw the previous token, and the next token each side derived.
+    fn resume_against(
+        client_token: [u8; 32],
+        current: [u8; 32],
+        previous: Option<[u8; 32]>,
+    ) -> Result<(bool, ResumptionToken, ResumptionToken), PairingFailure> {
+        let mut client = ClientHandshake::resume(dev(1), "laptop".into(), client_token);
+        let mut server = ServerHandshake::new(dev(2), "phone".into())
+            .with_unwindowed_pairing_secrets([secret()])
+            .with_resumption_tokens(HashMap::from([(dev(1), current)]))
+            .with_grace_tokens(
+                previous
+                    .map(|p| HashMap::from([(dev(1), p)]))
+                    .unwrap_or_default(),
+            );
+        let hello = client.start();
+        let Outcome::Send(challenge) = server.step(hello).unwrap() else {
+            panic!("expected challenge");
+        };
+        let Outcome::Send(proof) = client.step(challenge).unwrap() else {
+            panic!("expected proof");
+        };
+        match server.step(proof).unwrap() {
+            Outcome::Done {
+                session,
+                resumed,
+                previous_token,
+                ..
+            } => {
+                assert!(resumed, "a token proof is a resume, never a fresh pair");
+                let ok = HandshakeMessage::PairingOk {
+                    device_id: dev(2).0,
+                    display_name: "phone".into(),
+                };
+                let client_session = match client.step(ok).unwrap() {
+                    Outcome::Done { session, .. } => session,
+                    o => panic!("expected client Done, got {o:?}"),
+                };
+                Ok((
+                    previous_token,
+                    derive_reconnect_token(&client_session).unwrap(),
+                    derive_reconnect_token(&session).unwrap(),
+                ))
+            }
+            Outcome::Send(HandshakeMessage::PairingFailed { reason }) => Err(reason),
+            o => panic!("unexpected server outcome {o:?}"),
+        }
+    }
+
+    #[test]
+    fn a_phone_that_missed_one_rotation_resumes_with_its_previous_token() {
+        let (previous, client_next, server_next) =
+            resume_against([0x11; 32], [0x22; 32], Some([0x11; 32])).unwrap();
+        assert!(
+            previous,
+            "the host must know it was the previous token, so it can use it up"
+        );
+        // The session was re-derived from the key the phone actually proved, so
+        // both sides agree on the next token and the pairing is whole again.
+        assert_eq!(client_next.as_bytes(), server_next.as_bytes());
+    }
+
+    #[test]
+    fn the_current_token_still_resumes_while_a_previous_one_is_kept() {
+        let (previous, client_next, server_next) =
+            resume_against([0x22; 32], [0x22; 32], Some([0x11; 32])).unwrap();
+        assert!(!previous);
+        assert_eq!(client_next.as_bytes(), server_next.as_bytes());
+    }
+
+    #[test]
+    fn a_previous_token_without_a_grace_record_is_refused() {
+        assert_eq!(
+            resume_against([0x11; 32], [0x22; 32], None).unwrap_err(),
+            PairingFailure::WrongPin
+        );
+    }
+
+    #[test]
+    fn a_token_that_is_neither_current_nor_previous_is_refused() {
+        assert_eq!(
+            resume_against([0x33; 32], [0x22; 32], Some([0x11; 32])).unwrap_err(),
+            PairingFailure::WrongPin
+        );
+    }
+
+    #[test]
+    fn a_grace_token_alone_never_authenticates() {
+        // No current token, so this is a first pair. A leftover previous token must
+        // not stand in for the pairing secret.
+        let mut client = ClientHandshake::resume(dev(1), "laptop".into(), [0x11; 32]);
+        let mut server = ServerHandshake::new(dev(2), "phone".into())
+            .with_unwindowed_pairing_secrets([secret()])
+            .with_grace_tokens(HashMap::from([(dev(1), [0x11; 32])]));
+        let hello = client.start();
+        let Outcome::Send(challenge) = server.step(hello).unwrap() else {
+            panic!("expected challenge");
+        };
+        let Outcome::Send(proof) = client.step(challenge).unwrap() else {
+            panic!("expected proof");
+        };
+        match server.step(proof).unwrap() {
+            Outcome::Send(HandshakeMessage::PairingFailed { reason }) => {
+                assert_eq!(reason, PairingFailure::WrongPin);
+            }
+            o => panic!("a grace token alone must not authenticate, got {o:?}"),
         }
     }
 

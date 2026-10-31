@@ -88,8 +88,8 @@ fn push_entitlement_is_production_for_release_and_development_for_debug() {
 /// `cargo test` stops at the first failing test BINARY, so this file never ran.
 /// Bump every constant below together - see packaging/MAC_IOS_BUILD_RUNBOOK.md
 /// section 5.
-const MARKETING_VERSION: &str = "0.1.2";
-const BUILD_NUMBER: &str = "1.27";
+const MARKETING_VERSION: &str = "0.1.3";
+const BUILD_NUMBER: &str = "1.30";
 
 #[test]
 fn info_plist_has_mobile_permission_descriptions_and_build_number() {
@@ -234,6 +234,72 @@ fn ios_deployment_target_meets_the_app_store_floor() {
             line.trim()
         );
     }
+}
+
+/// Portty's layout is designed and tested for a phone only. xcodegen defaults an
+/// iOS target to iPhone AND iPad ("1,2"), which would offer the app to iPad users
+/// and make App Store Connect demand iPad screenshots. `project.yml` is the
+/// source and the pbxproj is the committed copy, so both are checked.
+#[test]
+fn ios_app_targets_iphone_only() {
+    let project = read("gen/apple/project.yml");
+    assert!(
+        project.contains("TARGETED_DEVICE_FAMILY: \"1\""),
+        "project.yml must set TARGETED_DEVICE_FAMILY: \"1\" (iPhone only)"
+    );
+
+    let pbxproj = read("gen/apple/portty-app.xcodeproj/project.pbxproj");
+    let families: Vec<&str> = pbxproj
+        .lines()
+        .filter(|line| line.contains("TARGETED_DEVICE_FAMILY"))
+        .collect();
+    assert!(
+        !families.is_empty(),
+        "the pbxproj must pin TARGETED_DEVICE_FAMILY"
+    );
+    for line in families {
+        let value = line
+            .split('=')
+            .nth(1)
+            .unwrap_or_default()
+            .trim()
+            .trim_end_matches(';')
+            .trim_matches('"');
+        assert_eq!(
+            value,
+            "1",
+            "every build configuration must target iPhone only, found: {}",
+            line.trim()
+        );
+    }
+}
+
+/// Export compliance. Portty bundles its own standard encryption and declares
+/// `ITSAppUsesNonExemptEncryption` as false (see the comment in `project.yml`).
+/// `true` would make App Store Connect reject the upload (error 90592) until an
+/// approved export document and its code are attached, so a change in either
+/// direction must be a decision, not an accident. Both copies must agree.
+#[test]
+fn export_compliance_is_declared_exempt_in_both_copies() {
+    let project = read("gen/apple/project.yml");
+    assert!(
+        project.contains("ITSAppUsesNonExemptEncryption: false"),
+        "project.yml must declare ITSAppUsesNonExemptEncryption: false"
+    );
+
+    let plist = read("gen/apple/portty-app_iOS/Info.plist");
+    let key = plist
+        .find("<key>ITSAppUsesNonExemptEncryption</key>")
+        .expect("Info.plist must declare ITSAppUsesNonExemptEncryption");
+    let after_key = plist[key..]
+        .split("<key>")
+        .nth(1)
+        .and_then(|rest| rest.split("</key>").nth(1))
+        .unwrap_or_default();
+    assert!(
+        after_key.trim_start().starts_with("<false/>"),
+        "Info.plist must set ITSAppUsesNonExemptEncryption to <false/>"
+    );
 }
 
 #[test]

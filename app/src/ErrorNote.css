@@ -1,0 +1,147 @@
+/* ErrorNote: one plain-words message with the technical text one tap away.
+   Its own file so it can land without touching the shared styles.css; the
+   colours and corners come from the tokens there. */
+
+.portty-note {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.55rem;
+  padding: 0.6rem 0.4rem 0.6rem 0.75rem;
+  border-radius: var(--radius-md);
+  border: 1px solid var(--border-strong);
+  background: var(--surface-2);
+  color: var(--text-2);
+}
+.portty-note--error {
+  border-color: rgb(var(--red-rgb) / 0.3);
+  border-left: 2px solid rgb(var(--red-rgb) / 0.8);
+  background: rgb(var(--red-rgb) / 0.08);
+}
+.portty-note__icon {
+  flex: none;
+  width: 1rem;
+  height: 1rem;
+  margin-top: 0.1rem;
+  color: var(--red-300);
+}
+.portty-note__body {
+  flex: 1 1 auto;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+}
+.portty-note__message {
+  margin: 0;
+  font-size: 0.82rem;
+  line-height: 1.45;
+  color: var(--text-1);
+  /* Commands and long words wrap instead of widening the screen. */
+  overflow-wrap: anywhere;
+}
+.portty-note__message code {
+  font-family: var(--mono);
+  font-size: 0.76rem;
+  color: var(--lime-bright);
+  background: rgb(var(--lime-rgb) / 0.08);
+  padding: 0.05rem 0.3rem;
+  border-radius: 0.3rem;
+  white-space: nowrap;
+}
+.portty-note__actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.25rem 1rem;
+}
+/* Text buttons, but tall enough to hit with a thumb. */
+.portty-note__action,
+.portty-note__link {
+  min-height: 2.25rem;
+  padding: 0 0.1rem;
+  background: none;
+  border: 0;
+  font-size: 0.8rem;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+  cursor: pointer;
+}
+.portty-note__action {
+  color: var(--lime-bright);
+  font-weight: 600;
+}
+.portty-note__link {
+  color: var(--text-2);
+}
+.portty-note__action:focus-visible,
+.portty-note__link:focus-visible,
+.portty-note__dismiss:focus-visible {
+  outline: 2px solid var(--lime);
+  outline-offset: 2px;
+  border-radius: 0.3rem;
+}
+.portty-note__detail {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 0.15rem;
+}
+.portty-note__detail pre {
+  margin: 0;
+  max-width: 100%;
+  max-height: 9rem;
+  overflow: auto;
+  padding: 0.45rem 0.55rem;
+  border-radius: 0.45rem;
+  background: var(--surface-1);
+  border: 1px solid var(--border);
+  font-family: var(--mono);
+  font-size: 0.7rem;
+  line-height: 1.45;
+  color: var(--text-2);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  /* The app shell turns selection off; support text has to be copyable. */
+  user-select: text;
+  -webkit-user-select: text;
+}
+.portty-note__dismiss {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 2.25rem;
+  height: 2.25rem;
+  margin: -0.4rem 0 -0.4rem 0;
+  background: none;
+  border: 0;
+  border-radius: 999px;
+  color: var(--text-3);
+  cursor: pointer;
+}
+.portty-note__dismiss .portty-icon {
+  width: 0.95rem;
+  height: 0.95rem;
+}
+
+/* The Home status line: under the header, above the host switcher. */
+.portty-home-status {
+  padding: 0.55rem 0.85rem;
+}
+.portty-home-status .portty-note {
+  padding-top: 0.5rem;
+  padding-bottom: 0.5rem;
+}
+/* Connection state only ("Not connected", "Reconnecting…") - no box. */
+.portty-home-status__state {
+  margin: 0;
+  font-size: 0.8rem;
+  line-height: 1.4;
+  color: var(--text-2);
+}
+
+/* A failed transfer, where the one-line transfer bar would cut it off. */
+.portty-transfer-problem {
+  padding: 0.4rem 0.6rem;
+  border-bottom: 1px solid var(--border);
+}

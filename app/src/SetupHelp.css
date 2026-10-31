@@ -1,0 +1,197 @@
+/* ── First-run setup card (SetupHelp.tsx) ─────────────────────────────
+   Home while no host is saved: how to put Portty on the computer, then
+   pair. Built from the same parts as the empty state it stands in for (the
+   >_ glyph and a .portty-card), so it reads as the same screen.
+
+   Its own file so the card's rules travel with the component. Selectors that
+   adjust a shared class (.portty-empty-glyph, .portty-btn-ghost) are scoped
+   under .portty-setup, so they win on specificity whichever stylesheet
+   loads last. */
+
+/* Top-aligned, unlike the centred empty state: the Linux command wraps to
+   more lines than the others, and in a centred column every tab switch would
+   slide the tab row under the user's thumb. Normal flow also keeps a card
+   taller than the screen (short phone, large text) fully scrollable. */
+.portty-setup {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 0.9rem;
+  padding-top: clamp(0.25rem, 4vh, 2rem);
+}
+
+/* A short screen (an iPhone SE, any phone on its side) keeps the room for
+   the steps. */
+@media (max-height: 700px) {
+  .portty-setup .portty-setup-glyph {
+    display: none;
+  }
+}
+
+.portty-setup .portty-setup-card {
+  display: flex;
+  flex-direction: column;
+  gap: 0.7rem;
+  width: 100%;
+  max-width: 26rem;
+}
+
+.portty-setup-title {
+  margin: 0;
+  font-size: 0.95rem;
+  font-weight: 650;
+  line-height: 1.3;
+  color: var(--text-1);
+}
+
+.portty-setup-text {
+  margin: 0;
+  font-size: 0.8rem;
+  line-height: 1.4;
+  color: var(--text-2);
+}
+
+/* Windows | macOS | Linux - the same segmented look as the folder picker's
+   Workspace | Home switcher. */
+.portty-setup-tabs {
+  display: flex;
+  gap: 0.25rem;
+  padding: 0.2rem;
+  border-radius: var(--radius-sm);
+  background: rgb(var(--lime-rgb) / 0.06);
+}
+.portty-setup-tab {
+  flex: 1;
+  min-height: 2.25rem;
+  padding: 0 0.5rem;
+  border: none;
+  border-radius: 0.4rem;
+  background: transparent;
+  color: var(--text-2);
+  font-size: 0.78rem;
+  font-weight: 600;
+  text-align: center;
+  -webkit-tap-highlight-color: transparent;
+  touch-action: manipulation;
+}
+.portty-setup-tab--on {
+  background: rgb(var(--lime-rgb) / 0.16);
+  color: var(--lime-bright);
+}
+.portty-setup-tab:focus-visible,
+.portty-setup-copy:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 2px rgb(var(--lime-rgb) / 0.55);
+}
+
+.portty-setup-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+}
+
+.portty-setup-command {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.4rem 0.4rem 0.4rem 0.75rem;
+  border-radius: var(--radius-md);
+  background: var(--surface-1);
+  border: 1px solid var(--border);
+}
+.portty-setup-command code {
+  flex: 1;
+  min-width: 0;
+  font-family: var(--mono);
+  font-size: 0.78rem;
+  line-height: 1.45;
+  color: var(--lime-bright);
+  overflow-wrap: anywhere;
+  /* App chrome is not selectable (styles.css, body). Here a long-press
+     selects the whole command, so it can still be copied by hand if the Copy
+     button cannot reach the clipboard. */
+  user-select: all;
+  -webkit-user-select: all;
+}
+.portty-setup-copy {
+  display: inline-flex;
+  flex: none;
+  align-items: center;
+  justify-content: center;
+  gap: 0.3rem;
+  min-width: 4.5rem;
+  min-height: 2.25rem;
+  padding: 0 0.7rem;
+  border-radius: var(--radius-sm);
+  background: var(--surface-2);
+  border: 1px solid var(--border-strong);
+  color: var(--text-1);
+  font-size: 0.75rem;
+  font-weight: 650;
+  white-space: nowrap;
+  -webkit-tap-highlight-color: transparent;
+  touch-action: manipulation;
+  transition:
+    background 0.12s var(--ease),
+    color 0.12s var(--ease);
+}
+.portty-setup-copy:active {
+  background: var(--surface-3);
+}
+.portty-setup-copy--done {
+  color: var(--lime-bright);
+  border-color: rgb(var(--lime-rgb) / 0.35);
+}
+
+/* Numbered with small lime discs instead of list markers. The disc sits in
+   the padding so the text keeps normal inline flow - <code> chips and all. */
+.portty-setup-steps {
+  display: flex;
+  flex-direction: column;
+  gap: 0.45rem;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  counter-reset: portty-setup-step;
+}
+.portty-setup-steps li {
+  position: relative;
+  padding-left: 1.75rem;
+  font-size: 0.8rem;
+  line-height: 1.45;
+  color: var(--text-2);
+  counter-increment: portty-setup-step;
+}
+.portty-setup-steps li::before {
+  content: counter(portty-setup-step);
+  position: absolute;
+  top: 0.05rem;
+  left: 0;
+  display: grid;
+  place-items: center;
+  width: 1.15rem;
+  height: 1.15rem;
+  border-radius: 999px;
+  background: rgb(var(--lime-rgb) / 0.12);
+  color: var(--lime-bright);
+  font-size: 0.66rem;
+  font-weight: 700;
+}
+/* Same chip as .portty-hint code, kept whole so a command never breaks
+   across lines. */
+.portty-setup-steps code {
+  font-family: var(--mono);
+  font-size: 0.75rem;
+  white-space: nowrap;
+  color: var(--lime-bright);
+  background: rgb(var(--lime-rgb) / 0.08);
+  padding: 0.05rem 0.3rem;
+  border-radius: 0.3rem;
+}
+
+/* .portty-btn-ghost grows to fill a row; in this column it just sits at
+   its own height. */
+.portty-setup .portty-setup-guide {
+  flex: none;
+  min-height: 2.5rem;
+}
